@@ -16,12 +16,12 @@
 package main
 
 import (
+	"context"
 	"flag"
 
 	"github.com/golang/glog"
 	"github.com/google/trillian"
 	"github.com/google/trillian/testonly"
-	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 )
 
@@ -29,6 +29,7 @@ var server = flag.String("server", "localhost:8091", "Server address:port")
 
 func main() {
 	flag.Parse()
+	defer glog.Flush()
 
 	conn, err := grpc.Dial(*server, grpc.WithInsecure())
 	if err != nil {
@@ -63,8 +64,7 @@ func main() {
 
 	{
 		req := &trillian.GetMapLeavesRequest{
-			MapId:    1,
-			Revision: -1,
+			MapId: 1,
 			Index: [][]byte{
 				index,
 			},

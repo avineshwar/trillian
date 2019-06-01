@@ -33,10 +33,13 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"time"
 
 	"github.com/golang/glog"
 	"github.com/golang/protobuf/ptypes"
 	"github.com/google/trillian"
+	"github.com/google/trillian/client"
+	"github.com/google/trillian/client/rpcflags"
 	"github.com/google/trillian/cmd"
 	"github.com/google/trillian/cmd/createtree/keys"
 	"github.com/google/trillian/crypto/keyspb"
@@ -46,6 +49,7 @@ import (
 
 var (
 	adminServerAddr = flag.String("admin_server", "", "Address of the gRPC Trillian Admin Server (host:port)")
+	rpcDeadline     = flag.Duration("rpc_deadline", time.Second*10, "Deadline for RPC requests")
 
 	treeState          = flag.String("tree_state", trillian.TreeState_ACTIVE.String(), "State of the new tree")
 	treeType           = flag.String("tree_type", trillian.TreeType_LOG.String(), "Type of the new tree")
@@ -58,11 +62,14 @@ var (
 	privateKeyFormat   = flag.String("private_key_format", "", "Type of protobuf message to send the key as (PrivateKey, PEMKeyFile, or PKCS11ConfigFile). If empty, a key will be generated for you by Trillian.")
 
 	configFile = flag.String("config", "", "Config file containing flags, file contents can be overridden by command line flags")
+
+	errAdminAddrNotSet = errors.New("empty --admin_server, please provide the Admin server host:port")
 )
 
+// TODO(Martin2112): Pass everything needed into this and don't refer to flags.
 func createTree(ctx context.Context) (*trillian.Tree, error) {
 	if *adminServerAddr == "" {
-		return nil, errors.New("empty --admin_server, please provide the Admin server host:port")
+		return nil, errAdminAddrNotSet
 	}
 
 	req, err := newRequest()
@@ -70,17 +77,22 @@ func createTree(ctx context.Context) (*trillian.Tree, error) {
 		return nil, err
 	}
 
-	conn, err := grpc.Dial(*adminServerAddr, grpc.WithInsecure())
+	dialOpts, err := rpcflags.NewClientDialOptionsFromFlags()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to determine dial options: %v", err)
+	}
+
+	conn, err := grpc.Dial(*adminServerAddr, dialOpts...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to dial %v: %v", *adminServerAddr, err)
 	}
 	defer conn.Close()
 
-	tree, err := trillian.NewTrillianAdminClient(conn).CreateTree(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-	return tree, nil
+	adminClient := trillian.NewTrillianAdminClient(conn)
+	mapClient := trillian.NewTrillianMapClient(conn)
+	logClient := trillian.NewTrillianLogClient(conn)
+
+	return client.CreateAndInitTree(ctx, req, adminClient, mapClient, logClient)
 }
 
 func newRequest() (*trillian.CreateTreeRequest, error) {
@@ -119,6 +131,7 @@ func newRequest() (*trillian.CreateTreeRequest, error) {
 		Description:        *description,
 		MaxRootDuration:    ptypes.DurationProto(*maxRootDuration),
 	}}
+	glog.Infof("Creating tree %+v", ctr.Tree)
 
 	if *privateKeyFormat != "" {
 		pk, err := keys.New(*privateKeyFormat)
@@ -148,6 +161,7 @@ func newRequest() (*trillian.CreateTreeRequest, error) {
 
 func main() {
 	flag.Parse()
+	defer glog.Flush()
 
 	if *configFile != "" {
 		if err := cmd.ParseFlagFile(*configFile); err != nil {
@@ -155,7 +169,8 @@ func main() {
 		}
 	}
 
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), *rpcDeadline)
+	defer cancel()
 	tree, err := createTree(ctx)
 	if err != nil {
 		glog.Exitf("Failed to create tree: %v", err)

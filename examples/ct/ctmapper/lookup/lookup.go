@@ -50,13 +50,12 @@ func main() {
 	for i := 0; i < flag.NArg(); i++ {
 		domain := flag.Arg(i)
 		req := &trillian.GetMapLeavesRequest{
-			MapId:    mapID,
-			Index:    [][]byte{ctmapper.HashDomain(domain)},
-			Revision: -1,
+			MapId: mapID,
+			Index: [][]byte{ctmapper.HashDomain(domain)},
 		}
 		resp, err := vmap.GetLeaves(context.Background(), req)
 		if err != nil {
-			glog.Warning("Failed to lookup domain %s: %v", domain, err)
+			glog.Warningf("Failed to lookup domain %s: %v", domain, err)
 			continue
 		}
 		for _, kv := range resp.MapLeafInclusion {
@@ -66,7 +65,7 @@ func main() {
 				continue
 			}
 			if err := pb.Unmarshal(v, &el); err != nil {
-				glog.Warning("Failed to unmarshal leaf %s: %v", kv.Leaf.LeafValue, err)
+				glog.Warningf("Failed to unmarshal leaf %s: %v", kv.Leaf.LeafValue, err)
 				continue
 			}
 			glog.Infof("Found %s with certs at indices %v and pre-certs at indices %v", el.Domain, el.CertIndex, el.PrecertIndex)

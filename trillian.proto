@@ -27,6 +27,20 @@ import "google/protobuf/any.proto";
 import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
 
+// LogRootFormat specifies the fields that are covered by the
+// SignedLogRoot signature, as well as their ordering and formats.
+enum LogRootFormat {
+  LOG_ROOT_FORMAT_UNKNOWN = 0;
+  LOG_ROOT_FORMAT_V1 = 1;
+}
+
+// MapRootFormat specifies the fields that are covered by the
+// SignedMapRoot signature, as well as their ordering and formats.
+enum MapRootFormat {
+  MAP_ROOT_FORMAT_UNKNOWN = 0;
+  MAP_ROOT_FORMAT_V1 = 1;
+}
+
 // What goes in here?
 // Things which are exposed through the public trillian APIs.
 
@@ -42,7 +56,7 @@ enum HashStrategy {
   RFC6962_SHA256 = 1;
 
   // Sparse Merkle Tree strategy:  leaf hash prefix = 0x00, node prefix = 0x01,
-  // empty branch is recursively computed from empty leaf nodes. 
+  // empty branch is recursively computed from empty leaf nodes.
   // NOT secure in a multi tree environment. For testing only.
   TEST_MAP_HASHER = 2;
 
@@ -50,8 +64,11 @@ enum HashStrategy {
   // All other properties are equal to RFC6962_SHA256.
   OBJECT_RFC6962_SHA256 = 3;
 
-  // The CONIKS sparse tree hasher with SHA512_256 as the hash algorithm. 
+  // The CONIKS sparse tree hasher with SHA512_256 as the hash algorithm.
   CONIKS_SHA512_256 = 4;
+
+  // The CONIKS sparse tree hasher with SHA256 as the hash algorithm.
+  CONIKS_SHA256 = 5;
 }
 
 // State of the tree.
@@ -64,51 +81,59 @@ enum TreeState {
   ACTIVE = 1;
 
   // Frozen trees are only able to respond to read requests, writing to a frozen
-  // tree is forbidden.
+  // tree is forbidden. Trees should not be frozen when there are entries
+  // in the queue that have not yet been integrated. See the DRAINING
+  // state for this case.
   FROZEN = 2;
 
-  // Tree was been deleted, therefore is invisible and acts similarly to a
-  // non-existing tree for all requests.
-  // A soft deleted tree may be undeleted while the soft-deletion period has not
-  // passed.
-  SOFT_DELETED = 3;
+  // Deprecated: now tracked in Tree.deleted.
+  DEPRECATED_SOFT_DELETED = 3 [deprecated = true];
 
-  // A hard deleted tree was been definitely deleted and cannot be recovered.
-  // Acts an a non-existing tree for all read and write requests, but blocks the
-  // tree ID from ever being reused.
-  HARD_DELETED = 4;
+  // Deprecated: now tracked in Tree.deleted.
+  DEPRECATED_HARD_DELETED = 4 [deprecated = true];
+
+  // A tree that is draining will continue to integrate queued entries.
+  // No new entries should be accepted.
+  DRAINING = 5;
 }
 
 // Type of the tree.
 enum TreeType {
-  // Tree type cannot be determined. Included to enable detection of
-  // mismatched proto versions being used. Represents an invalid value.
+  // Tree type cannot be determined. Included to enable detection of mismatched
+  // proto versions being used. Represents an invalid value.
   UNKNOWN_TREE_TYPE = 0;
 
   // Tree represents a verifiable log.
   LOG = 1;
 
   // Tree represents a verifiable map.
-  MAP  =2;
+  MAP = 2;
+
+  // Tree represents a verifiable pre-ordered log, i.e., a log whose entries are
+  // placed according to sequence numbers assigned outside of Trillian.
+  PREORDERED_LOG = 3;
 }
 
 // Represents a tree, which may be either a verifiable log or map.
 // Readonly attributes are assigned at tree creation, after which they may not
 // be modified.
+//
+// Note: Many APIs within the rest of the code require these objects to
+// be provided. For safety they should be obtained via Admin API calls and
+// not created dynamically.
 message Tree {
   // ID of the tree.
   // Readonly.
   int64 tree_id = 1;
 
   // State of the tree.
-  // Trees are active after creation. At any point the tree may transition
-  // between ACTIVE and FROZEN.
-  // Deleted trees are set as SOFT_DELETED for a certain time period, after
-  // which they'll automatically transition to HARD_DELETED.
+  // Trees are ACTIVE after creation. At any point the tree may transition
+  // between ACTIVE, DRAINING and FROZEN states.
   TreeState tree_state = 2;
 
   // Type of the tree.
-  // Readonly.
+  // Readonly after Tree creation. Exception: Can be switched from
+  // PREORDERED_LOG to LOG if the Tree is and remains in the FROZEN state.
   TreeType tree_type = 3;
 
   // Hash strategy to be used by the tree.
@@ -117,18 +142,14 @@ message Tree {
 
   // Hash algorithm to be used by the tree.
   // Readonly.
-  // TODO(gdbelvin): Deprecate in favor of signature_cipher_suite and hash_strategy.
   sigpb.DigitallySigned.HashAlgorithm hash_algorithm = 5;
 
   // Signature algorithm to be used by the tree.
   // Readonly.
-  // TODO(gdbelvin): Deprecate in favor of signature_cipher_suite.
   sigpb.DigitallySigned.SignatureAlgorithm signature_algorithm = 6;
 
-  // Signature cipher suite specifies the algorithms used to generate signatures.
-  sigpb.DigitallySigned.SignatureCipherSuite signature_cipher_suite = 18;
-
-  reserved 7;  // DuplicatePolicy (removed)
+  reserved 18;  // Signature cipher suite (removed)
+  reserved 7;   // DuplicatePolicy (removed)
 
   // Display name of the tree.
   // Optional.
@@ -146,9 +167,9 @@ message Tree {
   // This can be any type of message to accommodate different key management
   // systems, e.g. PEM files, HSMs, etc.
   // Private keys are write-only: they're never returned by RPCs.
-  // TODO(RJPercival): Implement sufficient validation to allow this field to be
-  // mutable. It should be mutable in the sense that the key can be migrated to
-  // a different key management system, but the key itself should never change.
+  // The private_key message can be changed after a tree is created, but the
+  // underlying key must remain the same - this is to enable migrating a key
+  // from one provider to another.
   google.protobuf.Any private_key = 12;
 
   // Storage-specific settings.
@@ -170,6 +191,16 @@ message Tree {
   // Time of last tree update.
   // Readonly (automatically assigned on updates).
   google.protobuf.Timestamp update_time = 17;
+
+  // If true, the tree has been deleted.
+  // Deleted trees may be undeleted during a certain time window, after which
+  // they're permanently deleted (and unrecoverable).
+  // Readonly.
+  bool deleted = 19;
+
+  // Time of tree deletion, if any.
+  // Readonly.
+  google.protobuf.Timestamp delete_time = 20;
 }
 
 message SignedEntryTimestamp {
@@ -180,31 +211,95 @@ message SignedEntryTimestamp {
 
 // SignedLogRoot represents a commitment by a Log to a particular tree.
 message SignedLogRoot {
-  // epoch nanoseconds, good until 2500ish
-  int64 timestamp_nanos = 1;
-  bytes root_hash = 2;
-  // TreeSize is the number of entries in the tree.
-  int64 tree_size = 3;
-  sigpb.DigitallySigned signature = 4;
+  // Deleted: TimestampNanos moved to LogRoot.
+  reserved 1;
+  // Deleted: RootHash moved to LogRoot.
+  reserved 2;
+  // Deleted: TreeSize moved to LogRoot.
+  reserved 3;
+  // Deleted: Signature replaced by LogRootSignature.
+  reserved 4;
+  // Deleted: LogID is associated with the public key that validates signature.
+  reserved 5;
+  // Deleted: TreeRevision moved to LogRoot.
+  reserved 6;
 
-  int64 log_id = 5;
-  int64 tree_revision = 6;
+  // key_hint is a hint to identify the public key for signature verification.
+  // key_hint is not authenticated and may be incorrect or missing, in which
+  // case all known public keys may be used to verify the signature.
+  // When directly communicating with a Trillian gRPC server, the key_hint will
+  // typically contain the LogID encoded as a big-endian 64-bit integer;
+  // however, in other contexts the key_hint is likely to have different
+  // contents (e.g. it could be a GUID, a URL + TreeID, or it could be
+  // derived from the public key itself).
+  bytes key_hint = 7;
+
+  // log_root holds the TLS-serialization of the following structure (described
+  // in RFC5246 notation): Clients should validate log_root_signature with
+  // VerifySignedLogRoot before deserializing log_root.
+  // enum { v1(1), (65535)} Version;
+  // struct {
+  //   uint64 tree_size;
+  //   opaque root_hash<0..128>;
+  //   uint64 timestamp_nanos;
+  //   uint64 revision;
+  //   opaque metadata<0..65535>;
+  // } LogRootV1;
+  // struct {
+  //   Version version;
+  //   select(version) {
+  //     case v1: LogRootV1;
+  //   }
+  // } LogRoot;
+  //
+  // A serialized v1 log root will therefore be laid out as:
+  //
+  // +---+---+---+---+---+---+---+---+---+---+---+---+---+---+-....--+
+  // | ver=1 |          tree_size            |len|    root_hashlen   |
+  // +---+---+---+---+---+---+---+---+---+---+---+---+---+---+-....--+
+  //
+  // +---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+
+  // |        timestamp_nanos        |      revision                 |
+  // +---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+
+  //
+  // +---+---+---+---+---+-....---+
+  // |  len  |    metadata        |
+  // +---+---+---+---+---+-....---+
+  //
+  // (with all integers encoded big-endian).
+  bytes log_root = 8;
+
+  // log_root_signature is the raw signature over log_root.
+  bytes log_root_signature = 9;
 }
-
-message MapperMetadata {
-  bytes source_log_id = 1;
-  int64 highest_fully_completed_seq = 2;
-  int64 highest_partially_completed_seq = 3;
- }
 
 // SignedMapRoot represents a commitment by a Map to a particular tree.
 message SignedMapRoot {
-  int64 timestamp_nanos = 1;
-  bytes root_hash = 2;
-  MapperMetadata metadata = 3;
-	// TODO(al): define serialized format for the signature scheme.
-  sigpb.DigitallySigned signature = 4;
+  reserved 1;  // Deprecated: Was timestamp_nanos. Use map_root.
+  reserved 2;  // Deprecated: Was root_hash. Use map_root.
+  reserved 3;  // Deprecated: Was MapperMetadata. Use map_root.
+  reserved 5;  // Deprecated: Was map_id. Use signature.
+  reserved 6;  // Deprecated: Was map_revision. Use map_root.
+  reserved 7;  // Deprecated: Was metadata Any. Use map_root.
+  reserved 8;  // Deprecated: Was metadata bytes. Use map_root.
 
-  int64 map_id = 5;
-  int64 map_revision = 6;
+  // map_root holds the TLS-serialization of the following structure (described
+  // in RFC5246 notation): Clients should validate signature with
+  // VerifySignedMapRoot before deserializing map_root.
+  // enum { v1(1), (65535)} Version;
+  // struct {
+  //   opaque root_hash<0..128>;
+  //   uint64 timestamp_nanos;
+  //   uint64 revision;
+  //   opaque metadata<0..65535>;
+  // } MapRootV1;
+  // struct {
+  //   Version version;
+  //   select(version) {
+  //     case v1: MapRootV1;
+  //   }
+  // } MapRoot;
+  bytes map_root = 9;
+  // Signature is the raw signature over MapRoot.
+  bytes signature = 4;
 }

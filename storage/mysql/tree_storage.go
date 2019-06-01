@@ -20,11 +20,13 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"fmt"
+	"runtime/debug"
 	"strings"
 	"sync"
 
 	"github.com/golang/glog"
 	"github.com/golang/protobuf/proto"
+	"github.com/google/trillian"
 	"github.com/google/trillian/storage"
 	"github.com/google/trillian/storage/cache"
 	"github.com/google/trillian/storage/storagepb"
@@ -35,8 +37,6 @@ const (
 	insertSubtreeMultiSQL = `INSERT INTO Subtree(TreeId, SubtreeId, Nodes, SubtreeRevision) ` + placeholderSQL
 	insertTreeHeadSQL     = `INSERT INTO TreeHead(TreeId,TreeHeadTimestamp,TreeSize,RootHash,TreeRevision,RootSignature)
 		 VALUES(?,?,?,?,?,?)`
-	selectTreeIDByTypeAndStateSQL       = "SELECT TreeId FROM Trees WHERE TreeType = ? AND TreeState = ?"
-	selectTreeRevisionAtSizeOrLargerSQL = "SELECT TreeRevision,TreeSize FROM TreeHead WHERE TreeId=? AND TreeSize>=? ORDER BY TreeRevision LIMIT 1"
 
 	selectSubtreeSQL = `
  SELECT x.SubtreeId, x.MaxRevision, Subtree.Nodes
@@ -45,7 +45,7 @@ const (
 	FROM Subtree n
 	WHERE n.SubtreeId IN (` + placeholderSQL + `) AND
 	 n.TreeId = ? AND n.SubtreeRevision <= ?
-	GROUP BY n.SubtreeId
+	GROUP BY n.TreeId, n.SubtreeId
  ) AS x
  INNER JOIN Subtree 
  ON Subtree.SubtreeId = x.SubtreeId 
@@ -95,7 +95,7 @@ func newTreeStorage(db *sql.DB) *mySQLTreeStorage {
 // placeholder slots. At most one placeholder will be expanded.
 func expandPlaceholderSQL(sql string, num int, first, rest string) string {
 	if num <= 0 {
-		panic(fmt.Errorf("Trying to expand SQL placeholder with <= 0 parameters: %s", sql))
+		panic(fmt.Errorf("trying to expand SQL placeholder with <= 0 parameters: %s", sql))
 	}
 
 	parameters := first + strings.Repeat(","+rest, num-1)
@@ -141,7 +141,7 @@ func (m *mySQLTreeStorage) setSubtreeStmt(ctx context.Context, num int) (*sql.St
 	return m.getStmt(ctx, insertSubtreeMultiSQL, num, "VALUES(?, ?, ?, ?)", "(?, ?, ?, ?)")
 }
 
-func (m *mySQLTreeStorage) beginTreeTx(ctx context.Context, treeID int64, hashSizeBytes int, subtreeCache cache.SubtreeCache) (treeTX, error) {
+func (m *mySQLTreeStorage) beginTreeTx(ctx context.Context, tree *trillian.Tree, hashSizeBytes int, subtreeCache cache.SubtreeCache) (treeTX, error) {
 	t, err := m.db.BeginTx(ctx, nil /* opts */)
 	if err != nil {
 		glog.Warningf("Could not start tree TX: %s", err)
@@ -149,8 +149,10 @@ func (m *mySQLTreeStorage) beginTreeTx(ctx context.Context, treeID int64, hashSi
 	}
 	return treeTX{
 		tx:            t,
+		mu:            &sync.Mutex{},
 		ts:            m,
-		treeID:        treeID,
+		treeID:        tree.TreeId,
+		treeType:      tree.TreeType,
 		hashSizeBytes: hashSizeBytes,
 		subtreeCache:  subtreeCache,
 		writeRevision: -1,
@@ -158,10 +160,13 @@ func (m *mySQLTreeStorage) beginTreeTx(ctx context.Context, treeID int64, hashSi
 }
 
 type treeTX struct {
+	// mu ensures that tx can only be used for one query/exec at a time.
+	mu            *sync.Mutex
 	closed        bool
 	tx            *sql.Tx
 	ts            *mySQLTreeStorage
 	treeID        int64
+	treeType      trillian.TreeType
 	hashSizeBytes int
 	subtreeCache  cache.SubtreeCache
 	writeRevision int64
@@ -333,27 +338,11 @@ func checkResultOkAndRowCountIs(res sql.Result, err error, count int64) error {
 	}
 
 	if rowsAffected != count {
-		return fmt.Errorf("Expected %d row(s) to be affected but saw: %d", count,
+		return fmt.Errorf("expected %d row(s) to be affected but saw: %d", count,
 			rowsAffected)
 	}
 
 	return nil
-}
-
-// GetTreeRevisionAtSize returns the max node version for a tree at a particular size.
-// It is an error to request tree sizes larger than the currently published tree size.
-// For an inexact tree size this implementation always returns the next largest revision if an
-// exact one does not exist but it isn't required to do so.
-func (t *treeTX) GetTreeRevisionIncludingSize(ctx context.Context, treeSize int64) (int64, int64, error) {
-	// Negative size is not sensible and a zero sized tree has no nodes so no revisions
-	if treeSize <= 0 {
-		return 0, 0, fmt.Errorf("invalid tree size: %d", treeSize)
-	}
-
-	var treeRevision, actualTreeSize int64
-	err := t.tx.QueryRowContext(ctx, selectTreeRevisionAtSizeOrLargerSQL, t.treeID, treeSize).Scan(&treeRevision, &actualTreeSize)
-
-	return treeRevision, actualTreeSize, err
 }
 
 // getSubtreesAtRev returns a GetSubtreesFunc which reads at the passed in rev.
@@ -365,10 +354,16 @@ func (t *treeTX) getSubtreesAtRev(ctx context.Context, rev int64) cache.GetSubtr
 
 // GetMerkleNodes returns the requests nodes at (or below) the passed in treeRevision.
 func (t *treeTX) GetMerkleNodes(ctx context.Context, treeRevision int64, nodeIDs []storage.NodeID) ([]storage.Node, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
 	return t.subtreeCache.GetNodes(nodeIDs, t.getSubtreesAtRev(ctx, treeRevision))
 }
 
 func (t *treeTX) SetMerkleNodes(ctx context.Context, nodes []storage.Node) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
 	for _, n := range nodes {
 		err := t.subtreeCache.SetNodeHash(n.NodeID, n.Hash,
 			func(nID storage.NodeID) (*storagepb.SubtreeProto, error) {
@@ -382,6 +377,9 @@ func (t *treeTX) SetMerkleNodes(ctx context.Context, nodes []storage.Node) error
 }
 
 func (t *treeTX) Commit() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
 	if t.writeRevision > -1 {
 		if err := t.subtreeCache.Flush(func(st []*storagepb.SubtreeProto) error {
 			return t.storeSubtrees(context.TODO(), st)
@@ -392,24 +390,34 @@ func (t *treeTX) Commit() error {
 	}
 	t.closed = true
 	if err := t.tx.Commit(); err != nil {
-		glog.Warningf("TX commit error: %s", err)
+		glog.Warningf("TX commit error: %s, stack:\n%s", err, string(debug.Stack()))
 		return err
 	}
 	return nil
 }
 
 func (t *treeTX) Rollback() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	return t.rollbackInternal()
+}
+
+func (t *treeTX) rollbackInternal() error {
 	t.closed = true
 	if err := t.tx.Rollback(); err != nil {
-		glog.Warningf("TX rollback error: %s", err)
+		glog.Warningf("TX rollback error: %s, stack:\n%s", err, string(debug.Stack()))
 		return err
 	}
 	return nil
 }
 
 func (t *treeTX) Close() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
 	if !t.closed {
-		err := t.Rollback()
+		err := t.rollbackInternal()
 		if err != nil {
 			glog.Warningf("Rollback error on Close(): %v", err)
 		}
@@ -419,15 +427,8 @@ func (t *treeTX) Close() error {
 }
 
 func (t *treeTX) IsOpen() bool {
-	return !t.closed
-}
+	t.mu.Lock()
+	defer t.mu.Unlock()
 
-func checkDatabaseAccessible(ctx context.Context, db *sql.DB) error {
-	stmt, err := db.PrepareContext(ctx, "SELECT TreeId FROM Trees LIMIT 1")
-	if err != nil {
-		return err
-	}
-	defer stmt.Close()
-	_, err = stmt.ExecContext(ctx)
-	return err
+	return !t.closed
 }

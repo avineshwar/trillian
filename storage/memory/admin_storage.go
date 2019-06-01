@@ -27,22 +27,27 @@ import (
 )
 
 // NewAdminStorage returns a storage.AdminStorage implementation backed by
-// memoryTreeStorage.
-func NewAdminStorage(ms storage.LogStorage) storage.AdminStorage {
-	return &memoryAdminStorage{ms.(*memoryLogStorage).memoryTreeStorage}
+// TreeStorage.
+func NewAdminStorage(ms *TreeStorage) storage.AdminStorage {
+	return &memoryAdminStorage{ms}
 }
 
 // memoryAdminStorage implements storage.AdminStorage
 type memoryAdminStorage struct {
-	ms *memoryTreeStorage
+	ms *TreeStorage
 }
 
 func (s *memoryAdminStorage) Snapshot(ctx context.Context) (storage.ReadOnlyAdminTX, error) {
-	return s.Begin(ctx)
+	return &adminTX{ms: s.ms}, nil
 }
 
-func (s *memoryAdminStorage) Begin(ctx context.Context) (storage.AdminTX, error) {
-	return &adminTX{ms: s.ms}, nil
+func (s *memoryAdminStorage) ReadWriteTransaction(ctx context.Context, f storage.AdminTXFunc) error {
+	tx := &adminTX{ms: s.ms}
+	defer tx.Close()
+	if err := f(ctx, tx); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *memoryAdminStorage) CheckDatabaseAccessible(ctx context.Context) error {
@@ -50,7 +55,7 @@ func (s *memoryAdminStorage) CheckDatabaseAccessible(ctx context.Context) error 
 }
 
 type adminTX struct {
-	ms *memoryTreeStorage
+	ms *TreeStorage
 	// mu guards reads/writes on closed, which happen only on
 	// Commit/Rollback/IsClosed/Close methods.
 	// We don't check closed on *all* methods (apart from the ones above),
@@ -100,16 +105,16 @@ func (t *adminTX) Close() error {
 
 func (t *adminTX) GetTree(ctx context.Context, treeID int64) (*trillian.Tree, error) {
 	tree := t.ms.getTree(treeID)
-	tree.RLock()
-	defer tree.RUnlock()
-
 	if tree == nil {
 		return nil, fmt.Errorf("no such treeID %d", treeID)
 	}
+	tree.RLock()
+	defer tree.RUnlock()
+
 	return tree.meta, nil
 }
 
-func (t *adminTX) ListTreeIDs(ctx context.Context) ([]int64, error) {
+func (t *adminTX) ListTreeIDs(ctx context.Context, includeDeleted bool) ([]int64, error) {
 	t.ms.mu.RLock()
 	defer t.ms.mu.RUnlock()
 
@@ -120,7 +125,7 @@ func (t *adminTX) ListTreeIDs(ctx context.Context) ([]int64, error) {
 	return ret, nil
 }
 
-func (t *adminTX) ListTrees(ctx context.Context) ([]*trillian.Tree, error) {
+func (t *adminTX) ListTrees(ctx context.Context, includeDeleted bool) ([]*trillian.Tree, error) {
 	t.ms.mu.RLock()
 	defer t.ms.mu.RUnlock()
 
@@ -132,7 +137,7 @@ func (t *adminTX) ListTrees(ctx context.Context) ([]*trillian.Tree, error) {
 }
 
 func (t *adminTX) CreateTree(ctx context.Context, tr *trillian.Tree) (*trillian.Tree, error) {
-	if err := storage.ValidateTreeForCreation(tr); err != nil {
+	if err := storage.ValidateTreeForCreation(ctx, tr); err != nil {
 		return nil, err
 	}
 	if err := validateStorageSettings(tr); err != nil {
@@ -161,7 +166,7 @@ func (t *adminTX) CreateTree(ctx context.Context, tr *trillian.Tree) (*trillian.
 	defer t.ms.mu.Unlock()
 	t.ms.trees[id] = newTree(meta)
 
-	glog.Infof("trees: %v", t.ms.trees)
+	glog.V(1).Infof("trees: %v", t.ms.trees)
 
 	return &meta, nil
 }
@@ -174,7 +179,7 @@ func (t *adminTX) UpdateTree(ctx context.Context, treeID int64, updateFunc func(
 	tree := mTree.meta
 	beforeUpdate := *tree
 	updateFunc(tree)
-	if err := storage.ValidateTreeForUpdate(&beforeUpdate, tree); err != nil {
+	if err := storage.ValidateTreeForUpdate(ctx, &beforeUpdate, tree); err != nil {
 		return nil, err
 	}
 	if err := validateStorageSettings(tree); err != nil {
@@ -187,6 +192,18 @@ func (t *adminTX) UpdateTree(ctx context.Context, treeID int64, updateFunc func(
 		return nil, err
 	}
 	return tree, nil
+}
+
+func (t *adminTX) SoftDeleteTree(ctx context.Context, treeID int64) (*trillian.Tree, error) {
+	return nil, fmt.Errorf("method not supported: SoftDeleteTree")
+}
+
+func (t *adminTX) HardDeleteTree(ctx context.Context, treeID int64) error {
+	return fmt.Errorf("method not supported: HardDeleteTree")
+}
+
+func (t *adminTX) UndeleteTree(ctx context.Context, treeID int64) (*trillian.Tree, error) {
+	return nil, fmt.Errorf("method not supported: UndeleteTree")
 }
 
 func validateStorageSettings(tree *trillian.Tree) error {

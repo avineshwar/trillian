@@ -17,17 +17,24 @@ package integration
 import (
 	"context"
 	"database/sql"
+	"errors"
 
-	_ "github.com/google/trillian/crypto/keys/der/proto" // Register PrivateKey ProtoHandler
-
+	"github.com/golang/protobuf/proto"
 	"github.com/google/trillian"
+	"github.com/google/trillian/crypto/keys/der"
+	"github.com/google/trillian/crypto/keyspb"
 	"github.com/google/trillian/extension"
+	"github.com/google/trillian/monitoring"
 	"github.com/google/trillian/quota"
 	"github.com/google/trillian/server"
 	"github.com/google/trillian/server/admin"
+	"github.com/google/trillian/server/interceptor"
 	"github.com/google/trillian/storage/mysql"
-
+	"github.com/google/trillian/storage/testdb"
 	"google.golang.org/grpc"
+
+	_ "github.com/google/trillian/crypto/keys/der/proto" // Register PrivateKey ProtoHandler
+	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 )
 
 // MapEnv is a map server and connected client.
@@ -40,9 +47,9 @@ type MapEnv struct {
 	grpcServer *grpc.Server
 	clientConn *grpc.ClientConn
 
-	// Public fields
-	MapClient   trillian.TrillianMapClient
-	AdminClient trillian.TrillianAdminClient
+	// Trillian API clients.
+	Map   trillian.TrillianMapClient
+	Admin trillian.TrillianAdminClient
 }
 
 // NewMapEnvFromConn connects to a map server.
@@ -53,26 +60,34 @@ func NewMapEnvFromConn(addr string) (*MapEnv, error) {
 	}
 
 	return &MapEnv{
-		clientConn:  cc,
-		MapClient:   trillian.NewTrillianMapClient(cc),
-		AdminClient: trillian.NewTrillianAdminClient(cc),
+		clientConn: cc,
+		Map:        trillian.NewTrillianMapClient(cc),
+		Admin:      trillian.NewTrillianAdminClient(cc),
 	}, nil
 }
 
 // NewMapEnv creates a fresh DB, map server, and client.
-func NewMapEnv(ctx context.Context, testID string) (*MapEnv, error) {
-	db, err := GetTestDB(testID)
+func NewMapEnv(ctx context.Context, singleTX bool) (*MapEnv, error) {
+	if !testdb.MySQLAvailable() {
+		return nil, errors.New("no MySQL available")
+	}
+
+	db, err := testdb.NewTrillianDB(ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	registry := extension.Registry{
-		AdminStorage: mysql.NewAdminStorage(db),
-		MapStorage:   mysql.NewMapStorage(db),
-		QuotaManager: quota.Noop(),
+		AdminStorage:  mysql.NewAdminStorage(db),
+		MapStorage:    mysql.NewMapStorage(db),
+		QuotaManager:  quota.Noop(),
+		MetricFactory: monitoring.InertMetricFactory{},
+		NewKeyProto: func(ctx context.Context, spec *keyspb.Specification) (proto.Message, error) {
+			return der.NewProtoFromSpec(spec)
+		},
 	}
 
-	ret, err := NewMapEnvWithRegistry(ctx, testID, registry)
+	ret, err := NewMapEnvWithRegistry(registry, singleTX)
 	if err != nil {
 		db.Close()
 		return nil, err
@@ -82,19 +97,27 @@ func NewMapEnv(ctx context.Context, testID string) (*MapEnv, error) {
 }
 
 // NewMapEnvWithRegistry uses the passed in Registry to create a map server and
-// client.  testID should be unique to each unittest package so as to allow
-// parallel tests.
-func NewMapEnvWithRegistry(ctx context.Context, testID string, registry extension.Registry) (*MapEnv, error) {
+// client.
+// If singleTX is set, the map will attempt to use a single transaction when
+// updating the map data.
+func NewMapEnvWithRegistry(registry extension.Registry, singleTX bool) (*MapEnv, error) {
 	addr, lis, err := listen()
 	if err != nil {
 		return nil, err
 	}
 
+	ti := interceptor.New(registry.AdminStorage, registry.QuotaManager, false /* quotaDryRun */, registry.MetricFactory)
+
 	// Create Map Server.
-	grpcServer := grpc.NewServer()
-	mapServer := server.NewTrillianMapServer(registry)
+	grpcServer := grpc.NewServer(
+		grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(
+			interceptor.ErrorWrapper,
+			ti.UnaryInterceptor,
+		)),
+	)
+	mapServer := server.NewTrillianMapServer(registry, server.TrillianMapServerOptions{UseSingleTransaction: singleTX})
 	trillian.RegisterTrillianMapServer(grpcServer, mapServer)
-	trillian.RegisterTrillianAdminServer(grpcServer, admin.New(registry))
+	trillian.RegisterTrillianAdminServer(grpcServer, admin.New(registry, nil /* allowedTreeTypes */))
 	go grpcServer.Serve(lis)
 
 	// Connect to the server.
@@ -105,12 +128,12 @@ func NewMapEnvWithRegistry(ctx context.Context, testID string, registry extensio
 	}
 
 	return &MapEnv{
-		registry:    registry,
-		mapServer:   mapServer,
-		grpcServer:  grpcServer,
-		clientConn:  cc,
-		MapClient:   trillian.NewTrillianMapClient(cc),
-		AdminClient: trillian.NewTrillianAdminClient(cc),
+		registry:   registry,
+		mapServer:  mapServer,
+		grpcServer: grpcServer,
+		clientConn: cc,
+		Map:        trillian.NewTrillianMapClient(cc),
+		Admin:      trillian.NewTrillianAdminClient(cc),
 	}, nil
 }
 
@@ -123,6 +146,7 @@ func (env *MapEnv) Close() {
 		env.grpcServer.GracefulStop()
 	}
 	if env.DB != nil {
+		// TODO(pavelkalinnikov): Drop the database.
 		env.DB.Close()
 	}
 }

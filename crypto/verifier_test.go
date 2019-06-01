@@ -15,11 +15,10 @@
 package crypto
 
 import (
+	"crypto"
 	"testing"
 
-	"github.com/google/trillian"
 	"github.com/google/trillian/crypto/keys/pem"
-	"github.com/google/trillian/crypto/sigpb"
 	"github.com/google/trillian/testonly"
 )
 
@@ -30,6 +29,10 @@ MHcCAQEEIGbhE2+z8d5lHzb0gmkS78d86gm5gHUtXCpXveFbK3pcoAoGCCqGSM49
 AwEHoUQDQgAEUxX42oxJ5voiNfbjoz8UgsGqh1bD1NXK9m8VivPmQSoYUdVFgNav
 csFaQhohkiCEthY51Ga6Xa+ggn+eTZtf9Q==
 -----END EC PRIVATE KEY-----`
+	// Taken from RFC 8410 section 10.3
+	ed25519PEM = `-----BEGIN PRIVATE KEY-----
+MC4CAQAwBQYDK2VwBCIEINTuctv5E1hK1bbY8fdp+K06/nwoy/HU++CXqI9EdVhC
+-----END PRIVATE KEY-----`
 )
 
 func TestSignVerify(t *testing.T) {
@@ -51,6 +54,10 @@ func TestSignVerify(t *testing.T) {
 			password: testonly.DemoPrivateKeyPass,
 		},
 		{
+			name: "Ed25519 key",
+			pem:  ed25519PEM,
+		},
+		{
 			name:          "Nil signature",
 			pem:           testonly.DemoPrivateKey,
 			password:      testonly.DemoPrivateKeyPass,
@@ -58,83 +65,26 @@ func TestSignVerify(t *testing.T) {
 			wantVerifyErr: true,
 		},
 	} {
-
-		key, err := pem.UnmarshalPrivateKey(test.pem, test.password)
-		if err != nil {
-			t.Errorf("%s: LoadPrivateKey(_, %q)=%v, want nil", test.name, test.password, err)
-			continue
-		}
-
-		// Sign and Verify.
-		msg := []byte("foo")
-		var signature *sigpb.DigitallySigned
-		if !test.skipSigning {
-			signature, err = NewSHA256Signer(key).Sign(msg)
+		t.Run(test.name, func(t *testing.T) {
+			key, err := pem.UnmarshalPrivateKey(test.pem, test.password)
 			if err != nil {
-				t.Errorf("%s: Sign()=(_,%v), want (_,nil)", test.name, err)
-				continue
+				t.Fatalf("UnmarshalPrivateKey(_, %q)=%v, want nil", test.password, err)
 			}
-		}
 
-		err = Verify(key.Public(), msg, signature)
-		if gotErr := err != nil; gotErr != test.wantVerifyErr {
-			t.Errorf("%s: Verify(,,)=%v, want err? %t", test.name, err, test.wantVerifyErr)
-		}
-	}
-}
+			// Sign and Verify.
+			msg := []byte("foo")
+			var signature []byte
+			if !test.skipSigning {
+				signature, err = NewSigner(0, key, crypto.SHA256).Sign(msg)
+				if err != nil {
+					t.Fatalf("Sign()=(_,%v), want (_,nil)", err)
+				}
+			}
 
-func TestSignVerifyObject(t *testing.T) {
-	key, err := pem.UnmarshalPrivateKey(testonly.DemoPrivateKey, testonly.DemoPrivateKeyPass)
-	if err != nil {
-		t.Fatalf("Failed to open test key, err=%v", err)
-	}
-	signer := NewSHA256Signer(key)
-
-	type subfield struct {
-		c int
-	}
-
-	for _, tc := range []struct {
-		obj interface{}
-	}{
-		{&trillian.MapperMetadata{}},
-		{&trillian.MapperMetadata{HighestFullyCompletedSeq: 0}},
-		{&trillian.MapperMetadata{HighestFullyCompletedSeq: 1}},
-
-		{&trillian.SignedMapRoot{}},
-		{&trillian.SignedMapRoot{
-			MapId: 0xcafe,
-		}},
-		{&trillian.SignedMapRoot{
-			Metadata: &trillian.MapperMetadata{},
-		}},
-		{&trillian.SignedMapRoot{
-			Metadata: &trillian.MapperMetadata{
-				HighestFullyCompletedSeq: 0,
-			},
-		}},
-		{&trillian.SignedMapRoot{
-			Metadata: &trillian.MapperMetadata{
-				HighestFullyCompletedSeq: 1,
-			},
-		}},
-		{struct{ a string }{a: "foo"}},
-		{struct {
-			a int
-			b *subfield
-		}{a: 1, b: &subfield{c: 0}}},
-		{struct {
-			a int
-			b *subfield
-		}{a: 1, b: nil}},
-	} {
-		sig, err := signer.SignObject(tc.obj)
-		if err != nil {
-			t.Errorf("SignObject(%#v): %v", tc.obj, err)
-			continue
-		}
-		if err := VerifyObject(key.Public(), tc.obj, sig); err != nil {
-			t.Errorf("SignObject(%#v): %v", tc.obj, err)
-		}
+			err = Verify(key.Public(), crypto.SHA256, msg, signature)
+			if gotErr := err != nil; gotErr != test.wantVerifyErr {
+				t.Errorf("Verify(,,)=%v, want err? %t", err, test.wantVerifyErr)
+			}
+		})
 	}
 }

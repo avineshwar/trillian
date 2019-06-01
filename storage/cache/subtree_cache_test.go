@@ -20,12 +20,11 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/google/trillian/merkle"
+	"github.com/google/trillian/merkle/compact"
 	"github.com/google/trillian/merkle/maphasher"
 	"github.com/google/trillian/merkle/rfc6962"
 	"github.com/google/trillian/storage"
 	"github.com/google/trillian/storage/storagepb"
-	"github.com/google/trillian/testonly"
 
 	"github.com/golang/mock/gomock"
 	"github.com/kylelemons/godebug/pretty"
@@ -36,7 +35,6 @@ import (
 var (
 	defaultLogStrata = []int{8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8}
 	defaultMapStrata = []int{8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 176}
-	h2b              = testonly.MustHexDecode
 )
 
 const treeID = int64(0)
@@ -68,16 +66,17 @@ func TestSplitNodeID(t *testing.T) {
 		n := storage.NewNodeIDFromHash(tc.inPath)
 		n.PrefixLenBits = tc.inPathLenBits
 
-		p, s := c.splitNodeID(n)
+		sInfo := c.stratumInfoForNodeID(n)
+		p, s := n.Split(sInfo.prefixBytes, sInfo.depth)
 		if got, want := p, tc.outPrefix; !bytes.Equal(got, want) {
 			t.Errorf("splitNodeID(%v): prefix %x, want %x", n, got, want)
 			continue
 		}
-		if got, want := int(s.Bits), tc.outSuffixBits; got != want {
+		if got, want := int(s.Bits()), tc.outSuffixBits; got != want {
 			t.Errorf("splitNodeID(%v): suffix.Bits %v, want %v", n, got, want)
 			continue
 		}
-		if got, want := s.Path, tc.outSuffix; !bytes.Equal(got, want) {
+		if got, want := s.Path(), tc.outSuffix; !bytes.Equal(got, want) {
 			t.Errorf("splitNodeID(%v): suffix.Path %x, want %x", n, got, want)
 		}
 	}
@@ -104,7 +103,7 @@ func TestCacheFillOnlyReadsSubtrees(t *testing.T) {
 	}
 
 	for nodeID.PrefixLenBits > 0 {
-		_, err := c.GetNodeHash(nodeID, m.GetSubtree)
+		_, err := c.getNodeHash(nodeID, m.GetSubtree)
 		if err != nil {
 			t.Fatalf("failed to get node hash: %v", err)
 		}
@@ -157,11 +156,11 @@ func TestCacheGetNodesReadsSubtrees(t *testing.T) {
 			return ret, nil
 		})
 	if err != nil {
-		t.Errorf("GetNodeHash(_, _) = _, %v", err)
+		t.Errorf("getNodeHash(_, _) = _, %v", err)
 	}
 }
 
-func noFetch(storage.NodeID) (*storagepb.SubtreeProto, error) {
+func noFetch(_ storage.NodeID) (*storagepb.SubtreeProto, error) {
 	return nil, errors.New("not supposed to read anything")
 }
 
@@ -213,7 +212,7 @@ func TestCacheFlush(t *testing.T) {
 	// Read nodes which touch the subtrees we'll write to:
 	sibs := nodeID.Siblings()
 	for s := range sibs {
-		_, err := c.GetNodeHash(sibs[s], m.GetSubtree)
+		_, err := c.getNodeHash(sibs[s], m.GetSubtree)
 		if err != nil {
 			t.Fatalf("failed to get node hash: %v", err)
 		}
@@ -249,7 +248,8 @@ func TestCacheFlush(t *testing.T) {
 
 func TestRepopulateLogSubtree(t *testing.T) {
 	populateTheThing := populateLogSubtreeNodes(rfc6962.DefaultHasher)
-	cmt := merkle.NewCompactMerkleTree(rfc6962.DefaultHasher)
+	fact := compact.RangeFactory{Hash: rfc6962.DefaultHasher.HashChildren}
+	cr := fact.NewEmptyRange(0)
 	cmtStorage := storagepb.SubtreeProto{
 		Leaves:        make(map[string][]byte),
 		InternalNodes: make(map[string][]byte),
@@ -266,19 +266,16 @@ func TestRepopulateLogSubtree(t *testing.T) {
 
 		leaf := []byte(fmt.Sprintf("this is leaf %d", numLeaves))
 		leafHash := rfc6962.DefaultHasher.HashLeaf(leaf)
-		_, err := cmt.AddLeafHash(leafHash, func(depth int, index int64, h []byte) error {
-			n, err := storage.NewNodeIDForTreeCoords(int64(depth), index, 8)
-			if err != nil {
-				return fmt.Errorf("failed to create nodeID for cmt tree: %v", err)
-			}
+		store := func(id compact.NodeID, hash []byte) {
+			n := stestonly.MustCreateNodeIDForTreeCoords(int64(id.Level), int64(id.Index), 8)
 			// Don't store leaves or the subtree root in InternalNodes
-			if depth > 0 && depth < 8 {
-				_, sfx := c.splitNodeID(n)
-				cmtStorage.InternalNodes[sfx.String()] = h
+			if id.Level > 0 && id.Level < 8 {
+				sInfo := c.stratumInfoForNodeID(n)
+				sfx := n.Suffix(sInfo.prefixBytes, sInfo.depth)
+				cmtStorage.InternalNodes[sfx.String()] = hash
 			}
-			return nil
-		})
-		if err != nil {
+		}
+		if err := cr.Append(leafHash, store); err != nil {
 			t.Fatalf("merkle tree update failed: %v", err)
 		}
 
@@ -296,7 +293,11 @@ func TestRepopulateLogSubtree(t *testing.T) {
 		if err := populateTheThing(&s); err != nil {
 			t.Fatalf("failed populate subtree: %v", err)
 		}
-		if got, expected := s.RootHash, cmt.CurrentRoot(); !bytes.Equal(got, expected) {
+		root, err := cr.GetRootHash(nil)
+		if err != nil {
+			t.Fatalf("GetRootHash: %v", err)
+		}
+		if got, expected := s.RootHash, root; !bytes.Equal(got, expected) {
 			t.Fatalf("Got root %v for tree size %d, expected %v. subtree:\n%#v", got, numLeaves, expected, s.String())
 		}
 
@@ -308,6 +309,29 @@ func TestRepopulateLogSubtree(t *testing.T) {
 			}
 		} else if diff := pretty.Compare(cmtStorage.InternalNodes, s.InternalNodes); diff != "" {
 			t.Fatalf("(it %d) CMT/sparse internal nodes diff:\n%v", numLeaves, diff)
+		}
+	}
+}
+
+func BenchmarkRepopulateLogSubtree(b *testing.B) {
+	hasher := rfc6962.DefaultHasher
+	s := storagepb.SubtreeProto{
+		Leaves:            make(map[string][]byte),
+		Depth:             int32(defaultLogStrata[0]),
+		InternalNodeCount: 254,
+	}
+	for i := 0; i < 256; i++ {
+		leaf := []byte(fmt.Sprintf("leaf %d", i))
+		hash := hasher.HashLeaf(leaf)
+		nodeID := storage.NewNodeIDFromPrefix(s.Prefix, logStrataDepth, int64(i), logStrataDepth, maxLogDepth)
+		_, sfx := nodeID.Split(len(s.Prefix), int(s.Depth))
+		s.Leaves[sfx.String()] = hash
+	}
+
+	populate := populateLogSubtreeNodes(hasher)
+	for n := 0; n < b.N; n++ {
+		if err := populate(&s); err != nil {
+			b.Fatalf("failed populate subtree: %v", err)
 		}
 	}
 }
@@ -342,6 +366,85 @@ func TestGetStratumInfo(t *testing.T) {
 	for i, tv := range testVec {
 		if diff := pretty.Compare(c.stratumInfoForPrefixLength(tv.depth), tv.info); diff != "" {
 			t.Errorf("(test %d for depth %d) diff:\n%v", i, tv.depth, diff)
+		}
+	}
+}
+
+func TestIdempotentWrites(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	m := NewMockNodeStorage(mockCtrl)
+
+	h := "0123456789abcdef0123456789abcdef"
+	nodeID := storage.NewNodeIDFromHash([]byte(h))
+	nodeID.PrefixLenBits = 40
+	subtreeID := nodeID
+	subtreeID.PrefixLenBits = 32
+
+	expectedSetIDs := make(map[string]string)
+	expectedSetIDs[subtreeID.String()] = "expected"
+
+	// The first time we read the subtree we'll emulate an empty subtree:
+	m.EXPECT().GetSubtree(stestonly.NodeIDEq(subtreeID)).Do(func(n storage.NodeID) {
+		t.Logf("read %v", n.String())
+	}).Return((*storagepb.SubtreeProto)(nil), nil)
+
+	// We should only see a single write attempt
+	m.EXPECT().SetSubtrees(gomock.Any()).Times(1).Do(func(trees []*storagepb.SubtreeProto) {
+		for _, s := range trees {
+			subID := storage.NewNodeIDFromHash(s.Prefix)
+			state, ok := expectedSetIDs[subID.String()]
+			if !ok {
+				t.Errorf("Unexpected write to subtree %s", subID.String())
+			}
+			switch state {
+			case "expected":
+				expectedSetIDs[subID.String()] = "met"
+			case "met":
+				t.Errorf("Second write to subtree %s", subID.String())
+			default:
+				t.Errorf("Unknown state for subtree %s: %s", subID.String(), state)
+			}
+
+			// After this write completes, subsequent reads will see the subtree
+			// being written now:
+			m.EXPECT().GetSubtree(stestonly.NodeIDEq(subID)).AnyTimes().Do(func(n storage.NodeID) {
+				t.Logf("read again %v", n.String())
+			}).Return(s, nil)
+
+			t.Logf("write %v -> %#v", subID.String(), s)
+		}
+	}).Return(nil)
+
+	// Now write the same value to the same node multiple times.
+	// We should see many reads, but only the first call to SetNodeHash should
+	// result in an actual write being flushed through to storage.
+	for i := 0; i < 10; i++ {
+		c := NewSubtreeCache(defaultMapStrata, populateMapSubtreeNodes(treeID, maphasher.Default), prepareMapSubtreeWrite())
+		_, err := c.getNodeHash(nodeID, m.GetSubtree)
+		if err != nil {
+			t.Fatalf("%d: failed to get node hash: %v", i, err)
+		}
+
+		err = c.SetNodeHash(nodeID, []byte("noodled"), noFetch)
+		if err != nil {
+			t.Fatalf("%d: failed to set node hash: %v", i, err)
+		}
+
+		if err := c.Flush(m.SetSubtrees); err != nil {
+			t.Fatalf("%d: failed to flush cache: %v", i, err)
+		}
+	}
+
+	for k, v := range expectedSetIDs {
+		switch v {
+		case "expected":
+			t.Errorf("Subtree %s remains unset", k)
+		case "met":
+			//
+		default:
+			t.Errorf("Unknown state for subtree %s: %s", k, v)
 		}
 	}
 }

@@ -15,7 +15,6 @@
 package memory
 
 import (
-	"bytes"
 	"container/list"
 	"context"
 	"errors"
@@ -31,7 +30,9 @@ import (
 	"github.com/google/trillian/monitoring"
 	"github.com/google/trillian/storage"
 	"github.com/google/trillian/storage/cache"
-	"github.com/google/trillian/trees"
+	"github.com/google/trillian/types"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const logIDLabel = "logid"
@@ -74,26 +75,44 @@ func hashToSeqKey(treeID int64) btree.Item {
 
 // sthKey formats a key for use in a tree's BTree store.
 // The associated Item value will be the STH with the given timestamp.
-func sthKey(treeID, timestamp int64) btree.Item {
+func sthKey(treeID int64, timestamp uint64) btree.Item {
 	return &kv{k: fmt.Sprintf("/%d/sth/%020d", treeID, timestamp)}
 }
 
+// getActiveLogIDs returns the IDs of all logs that are currently in a state
+// that requires sequencing (e.g. ACTIVE, DRAINING).
+func getActiveLogIDs(trees map[int64]*tree) []int64 {
+	var ret []int64
+	for id, tree := range trees {
+		if tree.meta.GetDeleted() {
+			continue
+		}
+
+		switch tree.meta.GetTreeType() {
+		case trillian.TreeType_LOG, trillian.TreeType_PREORDERED_LOG:
+			switch tree.meta.GetTreeState() {
+			case trillian.TreeState_ACTIVE, trillian.TreeState_DRAINING:
+				ret = append(ret, id)
+			}
+		}
+	}
+	return ret
+}
+
 type memoryLogStorage struct {
-	*memoryTreeStorage
-	admin         storage.AdminStorage
+	*TreeStorage
 	metricFactory monitoring.MetricFactory
 }
 
 // NewLogStorage creates an in-memory LogStorage instance.
-func NewLogStorage(mf monitoring.MetricFactory) storage.LogStorage {
+func NewLogStorage(ts *TreeStorage, mf monitoring.MetricFactory) storage.LogStorage {
 	if mf == nil {
 		mf = monitoring.InertMetricFactory{}
 	}
 	ret := &memoryLogStorage{
-		memoryTreeStorage: newTreeStorage(),
-		metricFactory:     mf,
+		TreeStorage:   ts,
+		metricFactory: mf,
 	}
-	ret.admin = NewAdminStorage(ret)
 	return ret
 }
 
@@ -102,11 +121,11 @@ func (m *memoryLogStorage) CheckDatabaseAccessible(ctx context.Context) error {
 }
 
 type readOnlyLogTX struct {
-	ms *memoryTreeStorage
+	ms *TreeStorage
 }
 
 func (m *memoryLogStorage) Snapshot(ctx context.Context) (storage.ReadOnlyLogTX, error) {
-	return &readOnlyLogTX{m.memoryTreeStorage}, nil
+	return &readOnlyLogTX{m.TreeStorage}, nil
 }
 
 func (t *readOnlyLogTX) Commit() error {
@@ -125,32 +144,20 @@ func (t *readOnlyLogTX) GetActiveLogIDs(ctx context.Context) ([]int64, error) {
 	t.ms.mu.RLock()
 	defer t.ms.mu.RUnlock()
 
-	ret := make([]int64, 0, len(t.ms.trees))
-	for k := range t.ms.trees {
-		ret = append(ret, k)
-	}
-	return ret, nil
+	return getActiveLogIDs(t.ms.trees), nil
 }
 
-func (m *memoryLogStorage) beginInternal(ctx context.Context, treeID int64, readonly bool) (storage.LogTreeTX, error) {
+func (m *memoryLogStorage) beginInternal(ctx context.Context, tree *trillian.Tree, readonly bool) (storage.LogTreeTX, error) {
 	once.Do(func() {
 		createMetrics(m.metricFactory)
 	})
-	tree, err := trees.GetTree(
-		ctx,
-		m.admin,
-		treeID,
-		trees.GetOpts{TreeType: trillian.TreeType_LOG, Readonly: readonly})
-	if err != nil {
-		return nil, err
-	}
 	hasher, err := hashers.NewLogHasher(tree.HashStrategy)
 	if err != nil {
 		return nil, err
 	}
 
 	stCache := cache.NewLogSubtreeCache(defaultLogStrata, hasher)
-	ttx, err := m.memoryTreeStorage.beginTreeTX(ctx, readonly, treeID, hasher.Size(), stCache)
+	ttx, err := m.TreeStorage.beginTreeTX(ctx, tree.TreeId, hasher.Size(), stCache, readonly)
 	if err != nil {
 		return nil, err
 	}
@@ -160,40 +167,98 @@ func (m *memoryLogStorage) beginInternal(ctx context.Context, treeID int64, read
 		ls:     m,
 	}
 
-	ltx.root, err = ltx.fetchLatestRoot(ctx)
-	if err != nil {
+	ltx.slr, err = ltx.fetchLatestRoot(ctx)
+	if err == storage.ErrTreeNeedsInit {
+		return ltx, err
+	} else if err != nil {
 		ttx.Rollback()
 		return nil, err
 	}
-	ltx.treeTX.writeRevision = ltx.root.TreeRevision + 1
+
+	if err := ltx.root.UnmarshalBinary(ltx.slr.LogRoot); err != nil {
+		ttx.Rollback()
+		return nil, err
+	}
+
+	ltx.treeTX.writeRevision = int64(ltx.root.Revision) + 1
 
 	return ltx, nil
 }
 
-func (m *memoryLogStorage) BeginForTree(ctx context.Context, treeID int64) (storage.LogTreeTX, error) {
-	return m.beginInternal(ctx, treeID, false /* readonly */)
+func (m *memoryLogStorage) ReadWriteTransaction(ctx context.Context, tree *trillian.Tree, f storage.LogTXFunc) error {
+	tx, err := m.beginInternal(ctx, tree, false /* readonly */)
+	if err != nil && err != storage.ErrTreeNeedsInit {
+		return err
+	}
+	defer tx.Close()
+	if err := f(ctx, tx); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
-func (m *memoryLogStorage) SnapshotForTree(ctx context.Context, treeID int64) (storage.ReadOnlyLogTreeTX, error) {
-	tx, err := m.beginInternal(ctx, treeID, true /* readonly */)
+func (m *memoryLogStorage) AddSequencedLeaves(ctx context.Context, tree *trillian.Tree, leaves []*trillian.LogLeaf, timestamp time.Time) ([]*trillian.QueuedLogLeaf, error) {
+	return nil, status.Errorf(codes.Unimplemented, "AddSequencedLeaves is not implemented")
+}
+
+func (m *memoryLogStorage) SnapshotForTree(ctx context.Context, tree *trillian.Tree) (storage.ReadOnlyLogTreeTX, error) {
+	tx, err := m.beginInternal(ctx, tree, true /* readonly */)
 	if err != nil {
 		return nil, err
 	}
 	return tx.(storage.ReadOnlyLogTreeTX), err
 }
 
+func (m *memoryLogStorage) QueueLeaves(ctx context.Context, tree *trillian.Tree, leaves []*trillian.LogLeaf, queueTimestamp time.Time) ([]*trillian.QueuedLogLeaf, error) {
+	tx, err := m.beginInternal(ctx, tree, false /* readonly */)
+	if tx != nil {
+		// Ensure we don't leak the transaction. For example if we get an
+		// ErrTreeNeedsInit from beginInternal() or if QueueLeaves fails
+		// below.
+		defer tx.Close()
+	}
+	if err != nil {
+		return nil, err
+	}
+	existing, err := tx.QueueLeaves(ctx, leaves, queueTimestamp)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+
+	ret := make([]*trillian.QueuedLogLeaf, len(leaves))
+	for i, e := range existing {
+		if e != nil {
+			ret[i] = &trillian.QueuedLogLeaf{
+				Leaf:   e,
+				Status: status.Newf(codes.AlreadyExists, "leaf already exists: %v", e.LeafIdentityHash).Proto(),
+			}
+			continue
+		}
+		ret[i] = &trillian.QueuedLogLeaf{Leaf: leaves[i]}
+	}
+	return ret, nil
+}
+
 type logTreeTX struct {
 	treeTX
 	ls   *memoryLogStorage
-	root trillian.SignedLogRoot
+	root types.LogRootV1
+	slr  trillian.SignedLogRoot
 }
 
-func (t *logTreeTX) ReadRevision() int64 {
-	return t.root.TreeRevision
+func (t *logTreeTX) ReadRevision(ctx context.Context) (int64, error) {
+	return int64(t.root.Revision), nil
 }
 
-func (t *logTreeTX) WriteRevision() int64 {
-	return t.treeTX.writeRevision
+func (t *logTreeTX) WriteRevision(ctx context.Context) (int64, error) {
+	if t.treeTX.writeRevision < 0 {
+		return t.treeTX.writeRevision, errors.New("logTreeTX write revision not populated")
+	}
+	return t.treeTX.writeRevision, nil
 }
 
 func (t *logTreeTX) DequeueLeaves(ctx context.Context, limit int, cutoffTime time.Time) ([]*trillian.LogLeaf, error) {
@@ -225,7 +290,11 @@ func (t *logTreeTX) QueueLeaves(ctx context.Context, leaves []*trillian.LogLeaf,
 	for _, l := range leaves {
 		q.PushBack(l)
 	}
-	return []*trillian.LogLeaf{}, nil
+	return make([]*trillian.LogLeaf, len(leaves)), nil
+}
+
+func (t *logTreeTX) AddSequencedLeaves(ctx context.Context, leaves []*trillian.LogLeaf, timestamp time.Time) ([]*trillian.QueuedLogLeaf, error) {
+	return nil, status.Errorf(codes.Unimplemented, "AddSequencedLeaves is not implemented")
 }
 
 func (t *logTreeTX) GetSequencedLeafCount(ctx context.Context) (int64, error) {
@@ -242,6 +311,17 @@ func (t *logTreeTX) GetLeavesByIndex(ctx context.Context, leaves []int64) ([]*tr
 	ret := make([]*trillian.LogLeaf, 0, len(leaves))
 	for _, seq := range leaves {
 		leaf := t.tx.Get(seqLeafKey(t.treeID, seq))
+		if leaf != nil {
+			ret = append(ret, leaf.(*kv).v.(*trillian.LogLeaf))
+		}
+	}
+	return ret, nil
+}
+
+func (t *logTreeTX) GetLeavesByRange(ctx context.Context, start, count int64) ([]*trillian.LogLeaf, error) {
+	ret := make([]*trillian.LogLeaf, 0, count)
+	for i := int64(0); i < count; i++ {
+		leaf := t.tx.Get(seqLeafKey(t.treeID, start+i))
 		if leaf != nil {
 			ret = append(ret, leaf.(*kv).v.(*trillian.LogLeaf))
 		}
@@ -270,21 +350,25 @@ func (t *logTreeTX) GetLeavesByHash(ctx context.Context, leafHashes [][]byte, or
 }
 
 func (t *logTreeTX) LatestSignedLogRoot(ctx context.Context) (trillian.SignedLogRoot, error) {
-	return t.root, nil
+	return t.slr, nil
 }
 
 // fetchLatestRoot reads the latest SignedLogRoot from the DB and returns it.
 func (t *logTreeTX) fetchLatestRoot(ctx context.Context) (trillian.SignedLogRoot, error) {
 	r := t.tx.Get(sthKey(t.treeID, t.tree.currentSTH))
 	if r == nil {
-		return trillian.SignedLogRoot{}, nil
+		return trillian.SignedLogRoot{}, storage.ErrTreeNeedsInit
 	}
 	return r.(*kv).v.(trillian.SignedLogRoot), nil
 }
 
-func (t *logTreeTX) StoreSignedLogRoot(ctx context.Context, root trillian.SignedLogRoot) error {
+func (t *logTreeTX) StoreSignedLogRoot(ctx context.Context, slr trillian.SignedLogRoot) error {
+	var root types.LogRootV1
+	if err := root.UnmarshalBinary(slr.LogRoot); err != nil {
+		return err
+	}
 	k := sthKey(t.treeID, root.TimestampNanos)
-	k.(*kv).v = root
+	k.(*kv).v = slr
 	t.tx.ReplaceOrInsert(k)
 
 	// TODO(alcutter): this breaks the transactional model
@@ -298,8 +382,8 @@ func (t *logTreeTX) UpdateSequencedLeaves(ctx context.Context, leaves []*trillia
 	countByMerkleHash := make(map[string]int)
 	for _, leaf := range leaves {
 		// This should fail on insert but catch it early
-		if len(leaf.LeafIdentityHash) != t.hashSizeBytes {
-			return errors.New("Sequenced leaf has incorrect hash size")
+		if got, want := len(leaf.LeafIdentityHash), t.hashSizeBytes; got != want {
+			return fmt.Errorf("sequenced leaf has incorrect hash size: got %v, want %v", got, want)
 		}
 		mh := string(leaf.MerkleLeafHash)
 		countByMerkleHash[mh]++
@@ -338,65 +422,6 @@ func (t *logTreeTX) UpdateSequencedLeaves(ctx context.Context, leaves []*trillia
 	return nil
 }
 
-func (t *logTreeTX) getActiveLogIDs(ctx context.Context) ([]int64, error) {
-	var ret []int64
-	for k := range t.ts.trees {
-		ret = append(ret, k)
-	}
-	return ret, nil
-}
-
-// GetActiveLogIDs returns a list of the IDs of all configured logs
 func (t *logTreeTX) GetActiveLogIDs(ctx context.Context) ([]int64, error) {
-	return t.getActiveLogIDs(ctx)
-}
-
-func (t *readOnlyLogTX) GetUnsequencedCounts(ctx context.Context) (storage.CountByLogID, error) {
-	t.ms.mu.RLock()
-	defer t.ms.mu.RUnlock()
-
-	ret := make(map[int64]int64)
-	for id, tree := range t.ms.trees {
-		tree.RLock()
-		defer tree.RUnlock() // OK to hold until method returns.
-
-		k := unseqKey(id)
-		queue := tree.store.Get(k).(*kv).v.(*list.List)
-		ret[id] = int64(queue.Len())
-	}
-	return ret, nil
-}
-
-// byLeafIdentityHash allows sorting of leaves by their identity hash, so DB
-// operations always happen in a consistent order.
-type byLeafIdentityHash []*trillian.LogLeaf
-
-func (l byLeafIdentityHash) Len() int {
-	return len(l)
-}
-func (l byLeafIdentityHash) Swap(i, j int) {
-	l[i], l[j] = l[j], l[i]
-}
-func (l byLeafIdentityHash) Less(i, j int) bool {
-	return bytes.Compare(l[i].LeafIdentityHash, l[j].LeafIdentityHash) == -1
-}
-
-// leafAndPosition records original position before sort.
-type leafAndPosition struct {
-	leaf *trillian.LogLeaf
-	idx  int
-}
-
-// byLeafIdentityHashWithPosition allows sorting (as above), but where we need
-// to remember the original position
-type byLeafIdentityHashWithPosition []leafAndPosition
-
-func (l byLeafIdentityHashWithPosition) Len() int {
-	return len(l)
-}
-func (l byLeafIdentityHashWithPosition) Swap(i, j int) {
-	l[i], l[j] = l[j], l[i]
-}
-func (l byLeafIdentityHashWithPosition) Less(i, j int) bool {
-	return bytes.Compare(l[i].leaf.LeafIdentityHash, l[j].leaf.LeafIdentityHash) == -1
+	return getActiveLogIDs(t.ts.trees), nil
 }

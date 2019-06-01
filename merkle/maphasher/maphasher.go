@@ -65,7 +65,9 @@ func (m *MapHasher) HashEmpty(treeID int64, index []byte, height int) []byte {
 		panic(fmt.Sprintf("HashEmpty(%v) out of bounds", height))
 	}
 	depth := m.BitLen() - height
-	glog.V(5).Infof("HashEmpty(%x, %d): %x", index, depth, m.nullHashes[height])
+	if glog.V(5) {
+		glog.Infof("HashEmpty(%x, %d): %x", index, depth, m.nullHashes[height])
+	}
 	return m.nullHashes[height]
 }
 
@@ -76,7 +78,9 @@ func (m *MapHasher) HashLeaf(treeID int64, index []byte, leaf []byte) []byte {
 	h.Write([]byte{leafHashPrefix})
 	h.Write(leaf)
 	r := h.Sum(nil)
-	glog.V(5).Infof("HashLeaf(%x): %x", index, r)
+	if glog.V(5) {
+		glog.Infof("HashLeaf(%x): %x", index, r)
+	}
 	return r
 }
 
@@ -88,7 +92,9 @@ func (m *MapHasher) HashChildren(l, r []byte) []byte {
 	h.Write(l)
 	h.Write(r)
 	p := h.Sum(nil)
-	glog.V(5).Infof("HashChildren(%x, %x): %x", l, r, p)
+	if glog.V(5) {
+		glog.Infof("HashChildren(%x, %x): %x", l, r, p)
+	}
 	return p
 }
 
@@ -105,7 +111,7 @@ func (m *MapHasher) initNullHashes() {
 	// Leaves are stored at depth 0. Root is at Size()*8.
 	// There are Size()*8 edges, and Size()*8 + 1 nodes in the tree.
 	nodes := m.Size()*8 + 1
-	r := make([][]byte, nodes, nodes)
+	r := make([][]byte, nodes)
 	r[0] = m.HashLeaf(0, nil, nil)
 	for i := 1; i < nodes; i++ {
 		r[i] = m.HashChildren(r[i-1], r[i-1])

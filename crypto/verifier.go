@@ -18,59 +18,68 @@ import (
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/rsa"
-	"encoding/asn1"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
 
-	"github.com/benlaurie/objecthash/go/objecthash"
-	"github.com/google/trillian/crypto/sigpb"
+	"github.com/google/certificate-transparency-go/asn1"
+	"github.com/google/trillian"
+	"github.com/google/trillian/types"
+	"golang.org/x/crypto/ed25519"
 )
 
-var (
-	errVerify = errors.New("signature verification failed")
+var errVerify = errors.New("signature verification failed")
 
-	cryptoHashLookup = map[sigpb.DigitallySigned_HashAlgorithm]crypto.Hash{
-		sigpb.DigitallySigned_SHA256: crypto.SHA256,
+// VerifySignedLogRoot verifies the SignedLogRoot and returns its contents.
+func VerifySignedLogRoot(pub crypto.PublicKey, hash crypto.Hash, r *trillian.SignedLogRoot) (*types.LogRootV1, error) {
+	if err := Verify(pub, hash, r.LogRoot, r.LogRootSignature); err != nil {
+		return nil, err
 	}
-)
 
-// VerifyObject verifies the output of Signer.SignObject.
-func VerifyObject(pub crypto.PublicKey, obj interface{}, sig *sigpb.DigitallySigned) error {
-	j, err := json.Marshal(obj)
-	if err != nil {
-		return err
+	var logRoot types.LogRootV1
+	if err := logRoot.UnmarshalBinary(r.LogRoot); err != nil {
+		return nil, err
 	}
-	hash := objecthash.CommonJSONHash(string(j))
+	return &logRoot, nil
+}
 
-	return Verify(pub, hash[:], sig)
+// VerifySignedMapRoot verifies the signature on the SignedMapRoot.
+// VerifySignedMapRoot returns MapRootV1 to encourage safe API use.
+// It should be the only function available to clients that returns MapRootV1.
+func VerifySignedMapRoot(pub crypto.PublicKey, hash crypto.Hash, smr *trillian.SignedMapRoot) (*types.MapRootV1, error) {
+	if smr == nil {
+		return nil, errors.New("SignedMapRoot is nil")
+	}
+	if err := Verify(pub, hash, smr.MapRoot, smr.Signature); err != nil {
+		return nil, err
+	}
+	var root types.MapRootV1
+	if err := root.UnmarshalBinary(smr.MapRoot); err != nil {
+		return nil, err
+	}
+	return &root, nil
 }
 
 // Verify cryptographically verifies the output of Signer.
-func Verify(pub crypto.PublicKey, data []byte, sig *sigpb.DigitallySigned) error {
+func Verify(pub crypto.PublicKey, hasher crypto.Hash, data, sig []byte) error {
 	if sig == nil {
 		return errors.New("signature is nil")
 	}
-
-	if got, want := sig.SignatureAlgorithm, SignatureAlgorithm(pub); got != want {
-		return fmt.Errorf("signature algorithm does not match public key, got:%v, want:%v", got, want)
+	if pubKey, ok := pub.(ed25519.PublicKey); ok {
+		// Ed25519 takes the whole message, not a hash digest.
+		return verifyEd25519(pubKey, data, sig)
 	}
 
-	// Recompute digest
-	hasher, ok := cryptoHashLookup[sig.HashAlgorithm]
-	if !ok {
-		return fmt.Errorf("unsupported hash algorithm %v", hasher)
-	}
 	h := hasher.New()
 	h.Write(data)
 	digest := h.Sum(nil)
 
 	switch pub := pub.(type) {
 	case *ecdsa.PublicKey:
-		return verifyECDSA(pub, digest, sig.Signature)
+		return verifyECDSA(pub, digest, sig)
 	case *rsa.PublicKey:
-		return verifyRSA(pub, digest, sig.Signature, hasher, hasher)
+		return verifyRSA(pub, digest, sig, hasher, hasher)
+
 	default:
 		return fmt.Errorf("unknown private key type: %T", pub)
 	}
@@ -99,5 +108,11 @@ func verifyECDSA(pub *ecdsa.PublicKey, hashed, sig []byte) error {
 		return errVerify
 	}
 	return nil
+}
 
+func verifyEd25519(pub ed25519.PublicKey, msg, sig []byte) error {
+	if !ed25519.Verify(pub, msg, sig) {
+		return errVerify
+	}
+	return nil
 }

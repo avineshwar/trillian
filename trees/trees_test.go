@@ -29,12 +29,15 @@ import (
 	"github.com/golang/protobuf/proto"
 	"github.com/golang/protobuf/ptypes"
 	"github.com/google/trillian"
-	tcrypto "github.com/google/trillian/crypto"
 	"github.com/google/trillian/crypto/keys"
 	"github.com/google/trillian/crypto/sigpb"
 	"github.com/google/trillian/storage"
 	"github.com/google/trillian/storage/testonly"
 	"github.com/kylelemons/godebug/pretty"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	tcrypto "github.com/google/trillian/crypto"
 )
 
 func TestFromContext(t *testing.T) {
@@ -71,13 +74,13 @@ func TestGetTree(t *testing.T) {
 	frozenTree.TreeId = 3
 	frozenTree.TreeState = trillian.TreeState_FROZEN
 
-	softDeletedTree := *testonly.LogTree
-	softDeletedTree.TreeId = 4
-	softDeletedTree.TreeState = trillian.TreeState_SOFT_DELETED
+	drainingTree := *testonly.LogTree
+	drainingTree.TreeId = 3
+	drainingTree.TreeState = trillian.TreeState_DRAINING
 
-	hardDeletedTree := *testonly.LogTree
-	hardDeletedTree.TreeId = 5
-	hardDeletedTree.TreeState = trillian.TreeState_HARD_DELETED
+	softDeletedTree := *testonly.LogTree
+	softDeletedTree.Deleted = true
+	softDeletedTree.DeleteTime = ptypes.TimestampNow()
 
 	tests := []struct {
 		desc                           string
@@ -86,74 +89,183 @@ func TestGetTree(t *testing.T) {
 		ctxTree, storageTree, wantTree *trillian.Tree
 		beginErr, getErr, commitErr    error
 		wantErr                        bool
+		code                           codes.Code
 	}{
+		{
+			desc:        "anyTree",
+			treeID:      logTree.TreeId,
+			opts:        NewGetOpts(Query),
+			storageTree: &logTree,
+			wantTree:    &logTree,
+		},
 		{
 			desc:        "logTree",
 			treeID:      logTree.TreeId,
-			opts:        GetOpts{TreeType: trillian.TreeType_LOG},
+			opts:        NewGetOpts(Query, trillian.TreeType_LOG),
 			storageTree: &logTree,
 			wantTree:    &logTree,
 		},
 		{
 			desc:        "mapTree",
 			treeID:      mapTree.TreeId,
-			opts:        GetOpts{TreeType: trillian.TreeType_MAP},
+			opts:        NewGetOpts(Query, trillian.TreeType_MAP),
+			storageTree: &mapTree,
+			wantTree:    &mapTree,
+		},
+		{
+			desc:        "logTreeButMaybeMap",
+			treeID:      logTree.TreeId,
+			opts:        NewGetOpts(Query, trillian.TreeType_LOG, trillian.TreeType_MAP),
+			storageTree: &logTree,
+			wantTree:    &logTree,
+		},
+		{
+			desc:        "mapTreeButMaybeLog",
+			treeID:      mapTree.TreeId,
+			opts:        NewGetOpts(Query, trillian.TreeType_LOG, trillian.TreeType_MAP),
 			storageTree: &mapTree,
 			wantTree:    &mapTree,
 		},
 		{
 			desc:        "wrongType1",
 			treeID:      logTree.TreeId,
-			opts:        GetOpts{TreeType: trillian.TreeType_MAP},
+			opts:        NewGetOpts(Query, trillian.TreeType_MAP),
 			storageTree: &logTree,
 			wantErr:     true,
+			code:        codes.InvalidArgument,
 		},
 		{
 			desc:        "wrongType2",
 			treeID:      mapTree.TreeId,
-			opts:        GetOpts{TreeType: trillian.TreeType_LOG},
+			opts:        NewGetOpts(Query, trillian.TreeType_LOG),
 			storageTree: &mapTree,
 			wantErr:     true,
+			code:        codes.InvalidArgument,
 		},
 		{
-			desc:        "frozenTree",
-			treeID:      frozenTree.TreeId,
-			opts:        GetOpts{TreeType: trillian.TreeType_LOG, Readonly: true},
+			desc:        "wrongType3",
+			treeID:      mapTree.TreeId,
+			opts:        NewGetOpts(Query, trillian.TreeType_LOG, trillian.TreeType_PREORDERED_LOG),
+			storageTree: &mapTree,
+			wantErr:     true,
+			code:        codes.InvalidArgument,
+		},
+		{
+			desc:        "adminLog",
+			treeID:      logTree.TreeId,
+			opts:        NewGetOpts(Admin, trillian.TreeType_LOG),
+			storageTree: &logTree,
+			wantTree:    &logTree,
+		},
+		{
+			desc:        "adminPreordered",
+			treeID:      testonly.PreorderedLogTree.TreeId,
+			opts:        NewGetOpts(Admin, trillian.TreeType_PREORDERED_LOG),
+			storageTree: testonly.PreorderedLogTree,
+			wantTree:    testonly.PreorderedLogTree,
+		},
+		{
+			desc:        "adminFrozen",
+			treeID:      logTree.TreeId,
+			opts:        NewGetOpts(Admin, trillian.TreeType_LOG),
 			storageTree: &frozenTree,
 			wantTree:    &frozenTree,
 		},
 		{
-			desc:        "frozenTreeNotReadonly",
+			desc:        "adminMap",
+			treeID:      mapTree.TreeId,
+			opts:        NewGetOpts(Admin, trillian.TreeType_MAP),
+			storageTree: &mapTree,
+			wantTree:    &mapTree,
+		},
+		{
+			desc:        "queryLog",
+			treeID:      logTree.TreeId,
+			opts:        NewGetOpts(Query, trillian.TreeType_LOG),
+			storageTree: &logTree,
+			wantTree:    &logTree,
+		},
+		{
+			desc:        "queryPreordered",
+			treeID:      testonly.PreorderedLogTree.TreeId,
+			opts:        NewGetOpts(Query, trillian.TreeType_PREORDERED_LOG),
+			storageTree: testonly.PreorderedLogTree,
+			wantTree:    testonly.PreorderedLogTree,
+		},
+		{
+			desc:        "queryMap",
+			treeID:      mapTree.TreeId,
+			opts:        NewGetOpts(Query, trillian.TreeType_MAP),
+			storageTree: &mapTree,
+			wantTree:    &mapTree,
+		},
+		{
+			desc:        "queryFrozen",
 			treeID:      frozenTree.TreeId,
-			opts:        GetOpts{TreeType: trillian.TreeType_LOG},
+			opts:        NewGetOpts(Query, trillian.TreeType_LOG),
 			storageTree: &frozenTree,
+			wantTree:    &frozenTree,
+		},
+		{
+			desc:        "sequenceFrozen",
+			treeID:      frozenTree.TreeId,
+			opts:        NewGetOpts(SequenceLog, trillian.TreeType_LOG),
+			storageTree: &frozenTree,
+			wantTree:    &frozenTree,
 			wantErr:     true,
+			code:        codes.PermissionDenied,
+		},
+		{
+			desc:        "queueFrozen",
+			treeID:      frozenTree.TreeId,
+			opts:        NewGetOpts(QueueLog, trillian.TreeType_LOG),
+			storageTree: &frozenTree,
+			wantTree:    &frozenTree,
+			wantErr:     true,
+			code:        codes.PermissionDenied,
+		},
+		{
+			desc:        "queryDraining",
+			treeID:      drainingTree.TreeId,
+			opts:        NewGetOpts(Query, trillian.TreeType_LOG),
+			storageTree: &drainingTree,
+			wantTree:    &drainingTree,
+		},
+		{
+			desc:        "sequenceDraining",
+			treeID:      drainingTree.TreeId,
+			opts:        NewGetOpts(SequenceLog, trillian.TreeType_LOG),
+			storageTree: &drainingTree,
+			wantTree:    &drainingTree,
+		},
+		{
+			desc:        "queueDraining",
+			treeID:      drainingTree.TreeId,
+			opts:        NewGetOpts(QueueLog, trillian.TreeType_LOG),
+			storageTree: &drainingTree,
+			wantTree:    &drainingTree,
+			wantErr:     true,
+			code:        codes.PermissionDenied,
 		},
 		{
 			desc:        "softDeleted",
 			treeID:      softDeletedTree.TreeId,
-			opts:        GetOpts{TreeType: trillian.TreeType_LOG},
+			opts:        NewGetOpts(Query, trillian.TreeType_LOG),
 			storageTree: &softDeletedTree,
-			wantErr:     true,
-		},
-		{
-			desc:        "hardDeleted",
-			treeID:      hardDeletedTree.TreeId,
-			opts:        GetOpts{TreeType: trillian.TreeType_LOG},
-			storageTree: &hardDeletedTree,
-			wantErr:     true,
+			wantErr:     true, // Deleted = true makes the tree "invisible" for most RPCs
+			code:        codes.NotFound,
 		},
 		{
 			desc:     "treeInCtx",
 			treeID:   logTree.TreeId,
-			opts:     GetOpts{TreeType: trillian.TreeType_LOG},
+			opts:     NewGetOpts(Query, trillian.TreeType_LOG),
 			ctxTree:  &logTree,
 			wantTree: &logTree,
 		},
 		{
 			desc:        "wrongTreeInCtx",
 			treeID:      logTree.TreeId,
-			opts:        GetOpts{TreeType: trillian.TreeType_LOG},
+			opts:        NewGetOpts(Query, trillian.TreeType_LOG),
 			ctxTree:     &mapTree,
 			storageTree: &logTree,
 			wantTree:    &logTree,
@@ -161,23 +273,26 @@ func TestGetTree(t *testing.T) {
 		{
 			desc:     "beginErr",
 			treeID:   logTree.TreeId,
-			opts:     GetOpts{TreeType: trillian.TreeType_LOG},
+			opts:     NewGetOpts(Query, trillian.TreeType_LOG),
 			beginErr: errors.New("begin err"),
 			wantErr:  true,
+			code:     codes.Unknown,
 		},
 		{
 			desc:    "getErr",
 			treeID:  logTree.TreeId,
-			opts:    GetOpts{TreeType: trillian.TreeType_LOG},
+			opts:    NewGetOpts(Query, trillian.TreeType_LOG),
 			getErr:  errors.New("get err"),
 			wantErr: true,
+			code:    codes.Unknown,
 		},
 		{
 			desc:      "commitErr",
 			treeID:    logTree.TreeId,
-			opts:      GetOpts{TreeType: trillian.TreeType_LOG},
+			opts:      NewGetOpts(Query, trillian.TreeType_LOG),
 			commitErr: errors.New("commit err"),
 			wantErr:   true,
+			code:      codes.Unknown,
 		},
 	}
 
@@ -189,8 +304,8 @@ func TestGetTree(t *testing.T) {
 
 		admin := storage.NewMockAdminStorage(ctrl)
 		tx := storage.NewMockReadOnlyAdminTX(ctrl)
-		admin.EXPECT().Snapshot(ctx).MaxTimes(1).Return(tx, test.beginErr)
-		tx.EXPECT().GetTree(ctx, test.treeID).MaxTimes(1).Return(test.storageTree, test.getErr)
+		admin.EXPECT().Snapshot(gomock.Any()).MaxTimes(1).Return(tx, test.beginErr)
+		tx.EXPECT().GetTree(gomock.Any(), test.treeID).MaxTimes(1).Return(test.storageTree, test.getErr)
 		tx.EXPECT().Close().MaxTimes(1).Return(nil)
 		tx.EXPECT().Commit().MaxTimes(1).Return(test.commitErr)
 
@@ -199,6 +314,9 @@ func TestGetTree(t *testing.T) {
 			t.Errorf("%v: GetTree() = (_, %q), wantErr = %v", test.desc, err, test.wantErr)
 			continue
 		} else if hasErr {
+			if status.Code(err) != test.code {
+				t.Errorf("%v: GetTree() = (_, %q), got ErrorCode: %v, want: %v", test.desc, err, status.Code(err), test.code)
+			}
 			continue
 		}
 
@@ -295,35 +413,36 @@ func TestSigner(t *testing.T) {
 
 	ctx := context.Background()
 	for _, test := range tests {
-		tree := *testonly.LogTree
-		tree.HashAlgorithm = sigpb.DigitallySigned_SHA256
-		tree.HashStrategy = trillian.HashStrategy_RFC6962_SHA256
-		tree.SignatureAlgorithm = test.sigAlgo
+		t.Run(test.desc, func(t *testing.T) {
+			tree := *testonly.LogTree
+			tree.HashAlgorithm = sigpb.DigitallySigned_SHA256
+			tree.HashStrategy = trillian.HashStrategy_RFC6962_SHA256
+			tree.SignatureAlgorithm = test.sigAlgo
 
-		var wantKeyProto ptypes.DynamicAny
-		if err := ptypes.UnmarshalAny(tree.PrivateKey, &wantKeyProto); err != nil {
-			t.Errorf("%v: failed to unmarshal tree.PrivateKey: %v", test.desc, err)
-		}
-
-		keys.RegisterHandler(wantKeyProto.Message, func(ctx context.Context, gotKeyProto proto.Message) (crypto.Signer, error) {
-			if !proto.Equal(gotKeyProto, wantKeyProto.Message) {
-				return nil, fmt.Errorf("NewSigner(_, %#v) called, want NewSigner(_, %#v)", gotKeyProto, wantKeyProto.Message)
+			var wantKeyProto ptypes.DynamicAny
+			if err := ptypes.UnmarshalAny(tree.PrivateKey, &wantKeyProto); err != nil {
+				t.Fatalf("failed to unmarshal tree.PrivateKey: %v", err)
 			}
-			return test.signer, test.newSignerErr
+
+			keys.RegisterHandler(wantKeyProto.Message, func(ctx context.Context, gotKeyProto proto.Message) (crypto.Signer, error) {
+				if !proto.Equal(gotKeyProto, wantKeyProto.Message) {
+					return nil, fmt.Errorf("NewSigner(_, %#v) called, want NewSigner(_, %#v)", gotKeyProto, wantKeyProto.Message)
+				}
+				return test.signer, test.newSignerErr
+			})
+			defer keys.UnregisterHandler(wantKeyProto.Message)
+
+			signer, err := Signer(ctx, &tree)
+			if hasErr := err != nil; hasErr != test.wantErr {
+				t.Fatalf("Signer(_, %s) = (_, %q), wantErr = %v", test.sigAlgo, err, test.wantErr)
+			} else if hasErr {
+				return
+			}
+
+			want := tcrypto.NewSigner(0, test.signer, crypto.SHA256)
+			if diff := pretty.Compare(signer, want); diff != "" {
+				t.Fatalf("post-Signer(_, %s) diff:\n%v", test.sigAlgo, diff)
+			}
 		})
-		defer keys.UnregisterHandler(wantKeyProto.Message)
-
-		signer, err := Signer(ctx, &tree)
-		if hasErr := err != nil; hasErr != test.wantErr {
-			t.Errorf("%v: Signer(_, %s) = (_, %q), wantErr = %v", test.desc, test.sigAlgo, err, test.wantErr)
-			continue
-		} else if hasErr {
-			continue
-		}
-
-		want := &tcrypto.Signer{Hash: crypto.SHA256, Signer: test.signer}
-		if diff := pretty.Compare(signer, want); diff != "" {
-			t.Errorf("%v: post-Signer(_, %s) diff:\n%v", test.desc, test.sigAlgo, diff)
-		}
 	}
 }

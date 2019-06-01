@@ -21,27 +21,16 @@ import (
 
 type noopManager struct{}
 
-const (
-	noopUser = "noopQuotaUser" // arbitrary string
-)
-
 // Noop returns a noop implementation of Manager. It allows all requests without restriction.
 func Noop() Manager {
 	return &noopManager{}
-}
-
-func (n noopManager) GetUser(ctx context.Context, req interface{}) string {
-	return noopUser
 }
 
 func (n noopManager) GetTokens(ctx context.Context, numTokens int, specs []Spec) error {
 	if err := validateNumTokens(numTokens); err != nil {
 		return err
 	}
-	if err := validateSpecs(specs); err != nil {
-		return err
-	}
-	return nil
+	return validateSpecs(specs)
 }
 
 func (n noopManager) PeekTokens(ctx context.Context, specs []Spec) (map[Spec]int, error) {
@@ -59,17 +48,11 @@ func (n noopManager) PutTokens(ctx context.Context, numTokens int, specs []Spec)
 	if err := validateNumTokens(numTokens); err != nil {
 		return err
 	}
-	if err := validateSpecs(specs); err != nil {
-		return err
-	}
-	return nil
+	return validateSpecs(specs)
 }
 
 func (n noopManager) ResetQuota(ctx context.Context, specs []Spec) error {
-	if err := validateSpecs(specs); err != nil {
-		return err
-	}
-	return nil
+	return validateSpecs(specs)
 }
 
 func (n noopManager) SetupInitialQuota(ctx context.Context, treeID int64) error {
@@ -86,8 +69,6 @@ func validateNumTokens(numTokens int) error {
 func validateSpecs(specs []Spec) error {
 	for _, spec := range specs {
 		switch {
-		case spec.Group == User && spec.User != noopUser:
-			return fmt.Errorf("invalid quota user: %v (expected %v)", spec.User, noopUser)
 		case spec.Group == Tree && spec.TreeID <= 0:
 			return fmt.Errorf("invalid tree ID: %v (expected >=0)", spec.TreeID)
 		}

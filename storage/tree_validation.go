@@ -15,57 +15,68 @@
 package storage
 
 import (
-	"crypto/x509"
+	"bytes"
+	"context"
 
+	"github.com/golang/protobuf/proto"
 	"github.com/golang/protobuf/ptypes"
 	"github.com/google/trillian"
+	"github.com/google/trillian/crypto/keys"
+	"github.com/google/trillian/crypto/keys/der"
 	"github.com/google/trillian/crypto/sigpb"
-	"github.com/google/trillian/errors"
-)
-
-const (
-	maxDisplayNameLength = 20
-	maxDescriptionLength = 200
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // ValidateTreeForCreation returns nil if tree is valid for insertion, error
 // otherwise.
 // See the documentation on trillian.Tree for reference on which values are
 // valid.
-func ValidateTreeForCreation(tree *trillian.Tree) error {
+func ValidateTreeForCreation(ctx context.Context, tree *trillian.Tree) error {
 	switch {
 	case tree == nil:
-		return errors.New(errors.InvalidArgument, "a tree is required")
+		return status.Error(codes.InvalidArgument, "a tree is required")
 	case tree.TreeState != trillian.TreeState_ACTIVE:
-		return errors.Errorf(errors.InvalidArgument, "invalid tree_state: %s", tree.TreeState)
+		return status.Errorf(codes.InvalidArgument, "invalid tree_state: %s", tree.TreeState)
 	case tree.TreeType == trillian.TreeType_UNKNOWN_TREE_TYPE:
-		return errors.Errorf(errors.InvalidArgument, "invalid tree_type: %s", tree.TreeType)
+		return status.Errorf(codes.InvalidArgument, "invalid tree_type: %s", tree.TreeType)
 	case tree.HashStrategy == trillian.HashStrategy_UNKNOWN_HASH_STRATEGY:
-		return errors.Errorf(errors.InvalidArgument, "invalid hash_strategy: %s", tree.HashStrategy)
+		return status.Errorf(codes.InvalidArgument, "invalid hash_strategy: %s", tree.HashStrategy)
 	case tree.HashAlgorithm == sigpb.DigitallySigned_NONE:
-		return errors.Errorf(errors.InvalidArgument, "invalid hash_algorithm: %s", tree.HashAlgorithm)
+		return status.Errorf(codes.InvalidArgument, "invalid hash_algorithm: %s", tree.HashAlgorithm)
 	case tree.SignatureAlgorithm == sigpb.DigitallySigned_ANONYMOUS:
-		return errors.Errorf(errors.InvalidArgument, "invalid signature_algorithm: %s", tree.SignatureAlgorithm)
+		return status.Errorf(codes.InvalidArgument, "invalid signature_algorithm: %s", tree.SignatureAlgorithm)
 	case tree.PrivateKey == nil:
-		return errors.New(errors.InvalidArgument, "a private_key is required")
+		return status.Error(codes.InvalidArgument, "a private_key is required")
 	case tree.PublicKey == nil:
-		return errors.New(errors.InvalidArgument, "a public_key is required")
+		return status.Error(codes.InvalidArgument, "a public_key is required")
+	case tree.Deleted:
+		return status.Errorf(codes.InvalidArgument, "invalid deleted: %v", tree.Deleted)
+	case tree.DeleteTime != nil:
+		return status.Errorf(codes.InvalidArgument, "invalid delete_time: %+v (must be nil)", tree.DeleteTime)
 	}
 
-	// Check that the private_key proto contains a valid serialized proto.
-	// This is enough at this layer, as the CreateTree RPC checks whether actually creating the
-	// configured hashers / signers is possible given the current extension.Registry.
-	var privateKey ptypes.DynamicAny
-	if err := ptypes.UnmarshalAny(tree.PrivateKey, &privateKey); err != nil {
-		return errors.Errorf(errors.InvalidArgument, "invalid private_key: %v", err)
+	return validateMutableTreeFields(ctx, tree)
+}
+
+// validateTreeTypeUpdate returns nil iff oldTree.TreeType can be updated to
+// newTree.TreeType. The tree type is changeable only if the Tree is and
+// remains in the FROZEN state.
+// At the moment only PREORDERED_LOG->LOG type transition is permitted.
+func validateTreeTypeUpdate(oldTree, newTree *trillian.Tree) error {
+	const prefix = "can't change tree_type"
+
+	const wantState = trillian.TreeState_FROZEN
+	if oldState := oldTree.TreeState; oldState != wantState {
+		return status.Errorf(codes.InvalidArgument, "%s: tree_state=%v, want %v", prefix, oldState, wantState)
+	} else if newTree.TreeState != wantState {
+		return status.Errorf(codes.InvalidArgument, "%s: tree_state should stay %v", prefix, wantState)
 	}
 
-	// Check that the public_key proto contains a valid DER-encoded public key.
-	if _, err := x509.ParsePKIXPublicKey(tree.PublicKey.GetDer()); err != nil {
-		return errors.Errorf(errors.InvalidArgument, "invalid public_key: %v", err)
+	if oldTree.TreeType != trillian.TreeType_PREORDERED_LOG || newTree.TreeType != trillian.TreeType_LOG {
+		return status.Errorf(codes.InvalidArgument, "%s: %v->%v", prefix, oldTree.TreeType, newTree.TreeType)
 	}
-
-	return validateMutableTreeFields(tree)
+	return nil
 }
 
 // ValidateTreeForUpdate returns nil if newTree is valid for update, error
@@ -75,44 +86,43 @@ func ValidateTreeForCreation(tree *trillian.Tree) error {
 // update_time, have not yet changed when this method is called.
 // See the documentation on trillian.Tree for reference on which fields may be
 // changed and what is considered valid for each of them.
-func ValidateTreeForUpdate(storedTree, newTree *trillian.Tree) error {
+func ValidateTreeForUpdate(ctx context.Context, storedTree, newTree *trillian.Tree) error {
 	// Check that readonly fields didn't change
 	switch {
 	case storedTree.TreeId != newTree.TreeId:
-		return errors.New(errors.InvalidArgument, "readonly field changed: tree_id")
+		return status.Error(codes.InvalidArgument, "readonly field changed: tree_id")
 	case storedTree.TreeType != newTree.TreeType:
-		return errors.New(errors.InvalidArgument, "readonly field changed: tree_type")
+		if err := validateTreeTypeUpdate(storedTree, newTree); err != nil {
+			return err
+		}
 	case storedTree.HashStrategy != newTree.HashStrategy:
-		return errors.New(errors.InvalidArgument, "readonly field changed: hash_strategy")
+		return status.Error(codes.InvalidArgument, "readonly field changed: hash_strategy")
 	case storedTree.HashAlgorithm != newTree.HashAlgorithm:
-		return errors.New(errors.InvalidArgument, "readonly field changed: hash_algorithm")
+		return status.Error(codes.InvalidArgument, "readonly field changed: hash_algorithm")
 	case storedTree.SignatureAlgorithm != newTree.SignatureAlgorithm:
-		return errors.New(errors.InvalidArgument, "readonly field changed: signature_algorithm")
-	case storedTree.CreateTime != newTree.CreateTime:
-		return errors.New(errors.InvalidArgument, "readonly field changed: create_time")
-	case storedTree.UpdateTime != newTree.UpdateTime:
-		return errors.New(errors.InvalidArgument, "readonly field changed: update_time")
-	case storedTree.PrivateKey != newTree.PrivateKey:
-		return errors.New(errors.InvalidArgument, "readonly field changed: private_key")
-	case storedTree.PublicKey != newTree.PublicKey:
-		return errors.New(errors.InvalidArgument, "readonly field changed: public_key")
+		return status.Error(codes.InvalidArgument, "readonly field changed: signature_algorithm")
+	case !proto.Equal(storedTree.CreateTime, newTree.CreateTime):
+		return status.Error(codes.InvalidArgument, "readonly field changed: create_time")
+	case !proto.Equal(storedTree.UpdateTime, newTree.UpdateTime):
+		return status.Error(codes.InvalidArgument, "readonly field changed: update_time")
+	case !proto.Equal(storedTree.PublicKey, newTree.PublicKey):
+		return status.Error(codes.InvalidArgument, "readonly field changed: public_key")
+	case storedTree.Deleted != newTree.Deleted:
+		return status.Error(codes.InvalidArgument, "readonly field changed: deleted")
+	case !proto.Equal(storedTree.DeleteTime, newTree.DeleteTime):
+		return status.Error(codes.InvalidArgument, "readonly field changed: delete_time")
 	}
-	return validateMutableTreeFields(newTree)
+	return validateMutableTreeFields(ctx, newTree)
 }
 
-func validateMutableTreeFields(tree *trillian.Tree) error {
-	switch {
-	case tree.TreeState == trillian.TreeState_UNKNOWN_TREE_STATE:
-		return errors.Errorf(errors.InvalidArgument, "invalid tree_state: %v", tree.TreeState)
-	case len(tree.DisplayName) > maxDisplayNameLength:
-		return errors.Errorf(errors.InvalidArgument, "display_name too big, max length is %v: %v", maxDisplayNameLength, tree.DisplayName)
-	case len(tree.Description) > maxDescriptionLength:
-		return errors.Errorf(errors.InvalidArgument, "description too big, max length is %v: %v", maxDescriptionLength, tree.Description)
+func validateMutableTreeFields(ctx context.Context, tree *trillian.Tree) error {
+	if tree.TreeState == trillian.TreeState_UNKNOWN_TREE_STATE {
+		return status.Errorf(codes.InvalidArgument, "invalid tree_state: %v", tree.TreeState)
 	}
 	if duration, err := ptypes.Duration(tree.MaxRootDuration); err != nil {
-		return errors.Errorf(errors.InvalidArgument, "max_root_duration malformed: %v", tree.MaxRootDuration)
+		return status.Errorf(codes.InvalidArgument, "max_root_duration malformed: %v", tree.MaxRootDuration)
 	} else if duration < 0 {
-		return errors.Errorf(errors.InvalidArgument, "max_root_duration negative: %v", tree.MaxRootDuration)
+		return status.Errorf(codes.InvalidArgument, "max_root_duration negative: %v", tree.MaxRootDuration)
 	}
 
 	// Implementations may vary, so let's assume storage_settings is mutable.
@@ -120,8 +130,26 @@ func validateMutableTreeFields(tree *trillian.Tree) error {
 	if tree.StorageSettings != nil {
 		var settings ptypes.DynamicAny
 		if err := ptypes.UnmarshalAny(tree.StorageSettings, &settings); err != nil {
-			return errors.Errorf(errors.InvalidArgument, "invalid storage_settings: %v", err)
+			return status.Errorf(codes.InvalidArgument, "invalid storage_settings: %v", err)
 		}
+	}
+
+	var privateKeyProto ptypes.DynamicAny
+	if err := ptypes.UnmarshalAny(tree.PrivateKey, &privateKeyProto); err != nil {
+		return status.Errorf(codes.InvalidArgument, "invalid private_key: %v", err)
+	}
+
+	// Check that the private key can be obtained and matches the public key.
+	privateKey, err := keys.NewSigner(ctx, privateKeyProto.Message)
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument, "invalid private_key: %v", err)
+	}
+	publicKeyDER, err := der.MarshalPublicKey(privateKey.Public())
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument, "invalid private_key: %v", err)
+	}
+	if !bytes.Equal(publicKeyDER, tree.PublicKey.GetDer()) {
+		return status.Errorf(codes.InvalidArgument, "private_key and public_key are not a matching pair")
 	}
 
 	return nil

@@ -26,7 +26,8 @@ import (
 	"testing"
 
 	"github.com/coreos/etcd/clientv3"
-	"github.com/gogo/protobuf/proto"
+	"github.com/golang/protobuf/proto"
+	"github.com/google/trillian/quota"
 	"github.com/google/trillian/quota/etcd/quotapb"
 	"github.com/google/trillian/quota/etcd/storage"
 	"github.com/google/trillian/quota/etcd/storagepb"
@@ -39,28 +40,21 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-const (
-	globalWriteName = "quotas/global/write/config"
-)
-
 var (
 	globalWrite = &quotapb.Config{
-		Name:      globalWriteName,
-		State:     quotapb.Config_ENABLED,
-		MaxTokens: 100,
+		Name:          "quotas/global/write/config",
+		State:         quotapb.Config_ENABLED,
+		MaxTokens:     100,
+		CurrentTokens: 100, // Assume quota is full
 		ReplenishmentStrategy: &quotapb.Config_SequencingBased{
 			SequencingBased: &quotapb.SequencingBasedStrategy{},
 		},
 	}
-	globalRead = copyWithName(globalWrite, "quotas/global/read/config")
-	tree1Read  = copyWithName(globalWrite, "quotas/trees/1/read/config")
-	tree1Write = copyWithName(globalWrite, "quotas/trees/1/write/config")
-	tree2Read  = copyWithName(globalWrite, "quotas/trees/2/read/config")
-	tree2Write = copyWithName(globalWrite, "quotas/trees/2/write/config")
-	userRead   = &quotapb.Config{
-		Name:      "quotas/users/llama/read/config",
-		State:     quotapb.Config_ENABLED,
-		MaxTokens: 100,
+	globalRead = &quotapb.Config{
+		Name:          "quotas/global/read/config",
+		State:         quotapb.Config_ENABLED,
+		MaxTokens:     100,
+		CurrentTokens: 100, // Assume quota is full
 		ReplenishmentStrategy: &quotapb.Config_TimeBased{
 			TimeBased: &quotapb.TimeBasedStrategy{
 				TokensToReplenish:        10000,
@@ -68,7 +62,12 @@ var (
 			},
 		},
 	}
-	userWrite = copyWithName(userRead, "quotas/users/llama/write/config")
+	tree1Read  = copyWithName(globalRead, "quotas/trees/1/read/config")
+	tree1Write = copyWithName(globalWrite, "quotas/trees/1/write/config")
+	tree2Read  = copyWithName(globalRead, "quotas/trees/2/read/config")
+	tree2Write = copyWithName(globalWrite, "quotas/trees/2/write/config")
+	userRead   = copyWithName(globalRead, "quotas/users/llama/read/config")
+	userWrite  = copyWithName(globalRead, "quotas/users/llama/write/config")
 
 	etcdClient  *clientv3.Client
 	quotaClient quotapb.QuotaClient
@@ -105,6 +104,7 @@ func TestMain(m *testing.M) {
 func TestServer_CreateConfig(t *testing.T) {
 	globalWrite2 := *globalWrite
 	globalWrite2.MaxTokens += 10
+	globalWrite2.CurrentTokens = globalWrite2.MaxTokens
 
 	overrideName := *globalWrite
 	overrideName.Name = "ignored"
@@ -120,25 +120,25 @@ func TestServer_CreateConfig(t *testing.T) {
 		},
 		{
 			desc:     "emptyConfig",
-			req:      &quotapb.CreateConfigRequest{Name: globalWriteName},
+			req:      &quotapb.CreateConfigRequest{Name: globalWrite.Name},
 			wantCode: codes.InvalidArgument,
 		},
 		{
 			desc:    "success",
-			req:     &quotapb.CreateConfigRequest{Name: globalWriteName, Config: globalWrite},
+			req:     &quotapb.CreateConfigRequest{Name: globalWrite.Name, Config: globalWrite},
 			wantCfg: globalWrite,
 		},
 		{
 			desc:     "alreadyExists",
 			baseCfg:  globalWrite,
-			req:      &quotapb.CreateConfigRequest{Name: globalWriteName, Config: &globalWrite2},
+			req:      &quotapb.CreateConfigRequest{Name: globalWrite.Name, Config: &globalWrite2},
 			wantCode: codes.AlreadyExists,
 			wantCfg:  globalWrite,
 		},
 		{
 			desc: "overrideName",
 			req: &quotapb.CreateConfigRequest{
-				Name:   globalWriteName,
+				Name:   globalWrite.Name,
 				Config: &overrideName,
 			},
 			wantCfg: globalWrite,
@@ -166,10 +166,13 @@ func TestServer_CreateConfig(t *testing.T) {
 
 func TestServer_UpdateConfig(t *testing.T) {
 	disabledGlobalWrite := *globalWrite
+	// Disabled quotas have "infinite" tokens
+	disabledGlobalWrite.CurrentTokens = int64(quota.MaxTokens)
 	disabledGlobalWrite.State = quotapb.Config_DISABLED
 
 	timeBasedGlobalWrite := *globalWrite
 	timeBasedGlobalWrite.MaxTokens += 100
+	timeBasedGlobalWrite.CurrentTokens = globalWrite.MaxTokens
 	timeBasedGlobalWrite.ReplenishmentStrategy = &quotapb.Config_TimeBased{
 		TimeBased: &quotapb.TimeBasedStrategy{
 			TokensToReplenish:        100,
@@ -178,6 +181,7 @@ func TestServer_UpdateConfig(t *testing.T) {
 	}
 
 	timeBasedGlobalWrite2 := timeBasedGlobalWrite
+	timeBasedGlobalWrite2.CurrentTokens = timeBasedGlobalWrite.MaxTokens
 	timeBasedGlobalWrite2.GetTimeBased().TokensToReplenish += 50
 	timeBasedGlobalWrite2.GetTimeBased().ReplenishIntervalSeconds -= 20
 
@@ -186,7 +190,7 @@ func TestServer_UpdateConfig(t *testing.T) {
 			desc:    "disableQuota",
 			baseCfg: globalWrite,
 			req: &quotapb.UpdateConfigRequest{
-				Name:       globalWriteName,
+				Name:       globalWrite.Name,
 				Config:     &quotapb.Config{State: disabledGlobalWrite.State},
 				UpdateMask: &field_mask.FieldMask{Paths: []string{"state"}},
 			},
@@ -196,7 +200,7 @@ func TestServer_UpdateConfig(t *testing.T) {
 			desc:    "timeBasedGlobalWrite",
 			baseCfg: globalWrite,
 			req: &quotapb.UpdateConfigRequest{
-				Name: globalWriteName,
+				Name: globalWrite.Name,
 				Config: &quotapb.Config{
 					MaxTokens:             timeBasedGlobalWrite.MaxTokens,
 					ReplenishmentStrategy: timeBasedGlobalWrite.ReplenishmentStrategy,
@@ -220,7 +224,7 @@ func TestServer_UpdateConfig(t *testing.T) {
 		{
 			desc: "unknownConfig",
 			req: &quotapb.UpdateConfigRequest{
-				Name:       globalWriteName,
+				Name:       globalWrite.Name,
 				Config:     &quotapb.Config{MaxTokens: 200},
 				UpdateMask: &field_mask.FieldMask{Paths: []string{"max_tokens"}},
 			},
@@ -230,7 +234,7 @@ func TestServer_UpdateConfig(t *testing.T) {
 			desc:    "badConfig",
 			baseCfg: globalWrite,
 			req: &quotapb.UpdateConfigRequest{
-				Name:       globalWriteName,
+				Name:       globalWrite.Name,
 				Config:     &quotapb.Config{}, // State == UNKNOWN
 				UpdateMask: &field_mask.FieldMask{Paths: []string{"state"}},
 			},
@@ -241,7 +245,7 @@ func TestServer_UpdateConfig(t *testing.T) {
 			desc:    "badPath",
 			baseCfg: globalWrite,
 			req: &quotapb.UpdateConfigRequest{
-				Name:       globalWriteName,
+				Name:       globalWrite.Name,
 				Config:     &quotapb.Config{},
 				UpdateMask: &field_mask.FieldMask{Paths: []string{"NOT_A_FIELD"}},
 			},
@@ -260,7 +264,7 @@ func TestServer_UpdateConfig(t *testing.T) {
 			desc:    "emptyConfig",
 			baseCfg: globalWrite,
 			req: &quotapb.UpdateConfigRequest{
-				Name:       globalWriteName,
+				Name:       globalWrite.Name,
 				UpdateMask: &field_mask.FieldMask{Paths: []string{"max_tokens"}},
 			},
 			wantCode: codes.InvalidArgument,
@@ -270,7 +274,7 @@ func TestServer_UpdateConfig(t *testing.T) {
 			desc:    "emptyMask",
 			baseCfg: globalWrite,
 			req: &quotapb.UpdateConfigRequest{
-				Name:   globalWriteName,
+				Name:   globalWrite.Name,
 				Config: &quotapb.Config{MaxTokens: 100},
 			},
 			wantCode: codes.InvalidArgument,
@@ -280,7 +284,7 @@ func TestServer_UpdateConfig(t *testing.T) {
 			desc:    "emptyConfigWithReset",
 			baseCfg: globalWrite,
 			req: &quotapb.UpdateConfigRequest{
-				Name:       globalWriteName,
+				Name:       globalWrite.Name,
 				UpdateMask: &field_mask.FieldMask{Paths: []string{"max_tokens"}},
 				ResetQuota: true,
 			},
@@ -291,7 +295,7 @@ func TestServer_UpdateConfig(t *testing.T) {
 			desc:    "emptyMaskWithReset",
 			baseCfg: globalWrite,
 			req: &quotapb.UpdateConfigRequest{
-				Name:       globalWriteName,
+				Name:       globalWrite.Name,
 				Config:     &quotapb.Config{MaxTokens: 100},
 				ResetQuota: true,
 			},
@@ -317,13 +321,13 @@ func TestServer_UpdateConfig_ResetQuota(t *testing.T) {
 		t.Fatalf("reset() returned err = %v", err)
 	}
 	if _, err := quotaClient.CreateConfig(ctx, &quotapb.CreateConfigRequest{
-		Name:   globalWriteName,
+		Name:   globalWrite.Name,
 		Config: globalWrite,
 	}); err != nil {
 		t.Fatalf("CreateConfig() returned err = %v", err)
 	}
 	qs := storage.QuotaStorage{Client: etcdClient}
-	if err := qs.Get(ctx, []string{globalWriteName}, globalWrite.MaxTokens-1); err != nil {
+	if err := qs.Get(ctx, []string{globalWrite.Name}, globalWrite.MaxTokens-1); err != nil {
 		t.Fatalf("Get() returned err = %v", err)
 	}
 
@@ -338,7 +342,7 @@ func TestServer_UpdateConfig_ResetQuota(t *testing.T) {
 		{
 			desc: "resetFalse",
 			req: &quotapb.UpdateConfigRequest{
-				Name:       globalWriteName,
+				Name:       globalWrite.Name,
 				Config:     &cfg,
 				UpdateMask: &field_mask.FieldMask{Paths: []string{"max_tokens"}},
 			},
@@ -346,7 +350,7 @@ func TestServer_UpdateConfig_ResetQuota(t *testing.T) {
 		},
 		{
 			desc:       "resetTrue",
-			req:        &quotapb.UpdateConfigRequest{Name: globalWriteName, ResetQuota: true},
+			req:        &quotapb.UpdateConfigRequest{Name: globalWrite.Name, ResetQuota: true},
 			wantTokens: cfg.MaxTokens,
 		},
 	}
@@ -428,6 +432,7 @@ func TestServer_UpdateConfig_Race(t *testing.T) {
 						continue
 					}
 
+					want.CurrentTokens = got.CurrentTokens // Not important for this test
 					want.MaxTokens = tokens
 					if !proto.Equal(got, &want) {
 						diff := pretty.Compare(got, &want)
@@ -522,7 +527,7 @@ func TestServer_DeleteConfig(t *testing.T) {
 			desc:       "global",
 			createCfgs: []*quotapb.Config{globalRead, globalWrite},
 			wantCfgs:   []*quotapb.Config{globalRead},
-			req:        &quotapb.DeleteConfigRequest{Name: globalWriteName},
+			req:        &quotapb.DeleteConfigRequest{Name: globalWrite.Name},
 		},
 		{
 			desc:       "user",
@@ -584,7 +589,7 @@ func TestServer_DeleteConfigErrors(t *testing.T) {
 		},
 		{
 			desc:     "unknown",
-			req:      &quotapb.DeleteConfigRequest{Name: globalWriteName},
+			req:      &quotapb.DeleteConfigRequest{Name: globalWrite.Name},
 			wantCode: codes.NotFound,
 		},
 	}
@@ -666,7 +671,7 @@ func TestServer_ListConfigs(t *testing.T) {
 	}
 
 	basicGlobalRead := &quotapb.Config{Name: globalRead.Name}
-	basicGlobalWrite := &quotapb.Config{Name: globalWriteName}
+	basicGlobalWrite := &quotapb.Config{Name: globalWrite.Name}
 	basicTree1Read := &quotapb.Config{Name: tree1Read.Name}
 	basicTree1Write := &quotapb.Config{Name: tree1Write.Name}
 	basicTree2Read := &quotapb.Config{Name: tree2Read.Name}

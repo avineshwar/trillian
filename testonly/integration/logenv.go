@@ -18,41 +18,38 @@ package integration
 
 import (
 	"context"
-	"crypto"
 	"database/sql"
 	"net"
 	"sync"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"                   // Load MySQL driver
-	_ "github.com/google/trillian/crypto/keys/der/proto" // Register PrivateKey ProtoHandler
+	"github.com/golang/glog"
+	"github.com/golang/protobuf/proto"
+	"google.golang.org/grpc"
 
-	"github.com/golang/protobuf/ptypes"
 	"github.com/google/trillian"
-	"github.com/google/trillian/crypto/keys/pem"
-	ktestonly "github.com/google/trillian/crypto/keys/testonly"
+	"github.com/google/trillian/crypto/keys/der"
 	"github.com/google/trillian/crypto/keyspb"
 	"github.com/google/trillian/extension"
+	"github.com/google/trillian/log"
 	"github.com/google/trillian/quota"
 	"github.com/google/trillian/server"
+	"github.com/google/trillian/server/admin"
 	"github.com/google/trillian/server/interceptor"
 	"github.com/google/trillian/storage/mysql"
-	stestonly "github.com/google/trillian/storage/testonly"
-	"github.com/google/trillian/testonly"
-	"github.com/google/trillian/util"
-	"google.golang.org/grpc"
+	"github.com/google/trillian/storage/testdb"
+	"github.com/google/trillian/util/clock"
+
+	_ "github.com/go-sql-driver/mysql"                   // Load MySQL driver
+	_ "github.com/google/trillian/crypto/keys/der/proto" // Register PrivateKey ProtoHandler
 )
 
 var (
 	sequencerWindow = time.Duration(0)
 	batchSize       = 50
 	// SequencerInterval is the time between runs of the sequencer.
-	SequencerInterval = 100 * time.Millisecond
-	timeSource        = util.SystemTimeSource{}
-	publicKey         = testonly.DemoPublicKey
-	privateKeyInfo    = &keyspb.PrivateKey{
-		Der: ktestonly.MustMarshalPrivatePEMToDER(testonly.DemoPrivateKey, testonly.DemoPrivateKeyPass),
-	}
+	SequencerInterval = 500 * time.Millisecond
+	timeSource        = clock.System
 )
 
 // LogEnv is a test environment that contains both a log server and a connection to it.
@@ -60,22 +57,31 @@ type LogEnv struct {
 	registry        extension.Registry
 	pendingTasks    *sync.WaitGroup
 	grpcServer      *grpc.Server
+	adminServer     *admin.Server
 	logServer       *server.TrillianLogRPCServer
-	LogOperation    server.LogOperation
-	Sequencer       *server.LogOperationManager
+	LogOperation    log.Operation
+	Sequencer       *log.OperationManager
 	sequencerCancel context.CancelFunc
-	ClientConn      *grpc.ClientConn
-	DB              *sql.DB
-	// PublicKey is the public key that verifies responses from this server.
-	PublicKey crypto.PublicKey
+	ClientConn      *grpc.ClientConn // TODO(gbelvin): Deprecate.
+
+	Address string
+	Log     trillian.TrillianLogClient
+	Admin   trillian.TrillianAdminClient
+	DB      *sql.DB
 }
 
 // NewLogEnv creates a fresh DB, log server, and client. The numSequencers parameter
 // indicates how many sequencers to run in parallel; if numSequencers is zero a
 // manually-controlled test sequencer is used.
-// testID should be unique to each unittest package so as to allow parallel tests.
-func NewLogEnv(ctx context.Context, numSequencers int, testID string) (*LogEnv, error) {
-	db, err := GetTestDB(testID)
+// TODO(codingllama): Remove 3rd parameter (need to coordinate with
+// github.com/google/certificate-transparency-go)
+func NewLogEnv(ctx context.Context, numSequencers int, _ string) (*LogEnv, error) {
+	return NewLogEnvWithGRPCOptions(ctx, numSequencers, nil, nil)
+}
+
+// NewLogEnvWithGRPCOptions works the same way as NewLogEnv, but allows callers to also set additional grpc.ServerOption and grpc.DialOption values.
+func NewLogEnvWithGRPCOptions(ctx context.Context, numSequencers int, serverOpts []grpc.ServerOption, clientOpts []grpc.DialOption) (*LogEnv, error) {
+	db, err := testdb.NewTrillianDB(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -84,10 +90,14 @@ func NewLogEnv(ctx context.Context, numSequencers int, testID string) (*LogEnv, 
 		AdminStorage: mysql.NewAdminStorage(db),
 		LogStorage:   mysql.NewLogStorage(db, nil),
 		QuotaManager: quota.Noop(),
+		NewKeyProto: func(ctx context.Context, spec *keyspb.Specification) (proto.Message, error) {
+			return der.NewProtoFromSpec(spec)
+		},
 	}
 
-	ret, err := NewLogEnvWithRegistry(ctx, numSequencers, testID, registry)
+	ret, err := NewLogEnvWithRegistryAndGRPCOptions(ctx, numSequencers, registry, serverOpts, clientOpts)
 	if err != nil {
+		db.Close()
 		return nil, err
 	}
 	ret.DB = db
@@ -98,20 +108,30 @@ func NewLogEnv(ctx context.Context, numSequencers int, testID string) (*LogEnv, 
 // and client. The numSequencers parameter indicates how many sequencers to
 // run in parallel; if numSequencers is zero a manually-controlled test
 // sequencer is used.
-// testID should be unique to each unittest package so as to allow parallel
-// tests.
-func NewLogEnvWithRegistry(ctx context.Context, numSequencers int, testID string, registry extension.Registry) (*LogEnv, error) {
-	// Create Log Server.
-	grpcServer := grpc.NewServer(grpc.UnaryInterceptor(interceptor.ErrorWrapper))
+func NewLogEnvWithRegistry(ctx context.Context, numSequencers int, registry extension.Registry) (*LogEnv, error) {
+	return NewLogEnvWithRegistryAndGRPCOptions(ctx, numSequencers, registry, nil, nil)
+}
+
+// NewLogEnvWithRegistryAndGRPCOptions works the same way as NewLogEnv, but allows callers to also set additional grpc.ServerOption and grpc.DialOption values.
+func NewLogEnvWithRegistryAndGRPCOptions(ctx context.Context, numSequencers int, registry extension.Registry, serverOpts []grpc.ServerOption, clientOpts []grpc.DialOption) (*LogEnv, error) {
+	// Create the GRPC Server.
+	serverOpts = append(serverOpts, grpc.UnaryInterceptor(interceptor.ErrorWrapper))
+	grpcServer := grpc.NewServer(serverOpts...)
+
+	// Setup the Admin Server.
+	adminServer := admin.New(registry, nil)
+	trillian.RegisterTrillianAdminServer(grpcServer, adminServer)
+
+	// Setup the Log Server.
 	logServer := server.NewTrillianLogRPCServer(registry, timeSource)
 	trillian.RegisterTrillianLogServer(grpcServer, logServer)
 
 	// Create Sequencer.
-	sequencerManager := server.NewSequencerManager(registry, sequencerWindow)
+	sequencerManager := log.NewSequencerManager(registry, sequencerWindow)
 	var wg sync.WaitGroup
-	var sequencerTask *server.LogOperationManager
+	var sequencerTask *log.OperationManager
 	ctx, cancel := context.WithCancel(ctx)
-	info := server.LogOperationInfo{
+	info := log.OperationInfo{
 		Registry:    registry,
 		BatchSize:   batchSize,
 		NumWorkers:  numSequencers,
@@ -119,9 +139,9 @@ func NewLogEnvWithRegistry(ctx context.Context, numSequencers int, testID string
 		TimeSource:  timeSource,
 	}
 	// Start a live sequencer in a goroutine.
-	sequencerTask = server.NewLogOperationManager(info, sequencerManager)
+	sequencerTask = log.NewOperationManager(info, sequencerManager)
 	wg.Add(1)
-	go func(wg *sync.WaitGroup, om *server.LogOperationManager) {
+	go func(wg *sync.WaitGroup, om *log.OperationManager) {
 		defer wg.Done()
 		om.OperationLoop(ctx)
 	}(&wg, sequencerTask)
@@ -135,17 +155,18 @@ func NewLogEnvWithRegistry(ctx context.Context, numSequencers int, testID string
 	wg.Add(1)
 	go func(wg *sync.WaitGroup, grpcServer *grpc.Server, lis net.Listener) {
 		defer wg.Done()
-		grpcServer.Serve(lis)
+		if err := grpcServer.Serve(lis); err != nil {
+			glog.Errorf("gRPC server stopped: %v", err)
+			glog.Flush()
+		}
 	}(&wg, grpcServer, lis)
 
 	// Connect to the server.
-	cc, err := grpc.Dial(addr, grpc.WithInsecure())
-	if err != nil {
-		cancel()
-		return nil, err
+	if clientOpts == nil {
+		clientOpts = []grpc.DialOption{grpc.WithInsecure()}
 	}
 
-	publicKey, err := pem.UnmarshalPublicKey(publicKey)
+	cc, err := grpc.Dial(addr, clientOpts...)
 	if err != nil {
 		cancel()
 		return nil, err
@@ -155,9 +176,12 @@ func NewLogEnvWithRegistry(ctx context.Context, numSequencers int, testID string
 		registry:        registry,
 		pendingTasks:    &wg,
 		grpcServer:      grpcServer,
+		adminServer:     adminServer,
 		logServer:       logServer,
+		Address:         addr,
 		ClientConn:      cc,
-		PublicKey:       publicKey,
+		Log:             trillian.NewTrillianLogClient(cc),
+		Admin:           trillian.NewTrillianAdminClient(cc),
 		LogOperation:    sequencerManager,
 		Sequencer:       sequencerTask,
 		sequencerCancel: cancel,
@@ -175,30 +199,4 @@ func (env *LogEnv) Close() {
 	if env.DB != nil {
 		env.DB.Close()
 	}
-}
-
-// CreateLog creates a log and signs the first empty tree head.
-func (env *LogEnv) CreateLog() (int64, error) {
-	ctx := context.Background()
-	tx, err := env.registry.AdminStorage.Begin(ctx)
-	if err != nil {
-		return 0, err
-	}
-
-	tree := stestonly.LogTree
-	tree.PrivateKey, err = ptypes.MarshalAny(privateKeyInfo)
-	if err != nil {
-		return 0, err
-	}
-
-	tree, err = tx.CreateTree(ctx, tree)
-	if err != nil {
-		return 0, err
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, err
-	}
-	// Sign the first empty tree head.
-	env.Sequencer.OperationSingle(ctx)
-	return tree.TreeId, nil
 }

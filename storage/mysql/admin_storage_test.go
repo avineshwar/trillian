@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/golang/protobuf/proto"
 	"github.com/golang/protobuf/ptypes"
 	"github.com/google/trillian"
 	"github.com/google/trillian/crypto/keyspb"
@@ -42,9 +43,9 @@ func TestAdminTX_CreateTree_InitializesStorageStructures(t *testing.T) {
 	s := NewAdminStorage(DB)
 	ctx := context.Background()
 
-	tree, err := createTreeInternal(ctx, s, testonly.LogTree)
+	tree, err := storage.CreateTree(ctx, s, testonly.LogTree)
 	if err != nil {
-		t.Fatalf("createTree() failed: %v", err)
+		t.Fatalf("CreateTree() failed: %v", err)
 	}
 
 	// Check if TreeControl is correctly written.
@@ -60,6 +61,22 @@ func TestAdminTX_CreateTree_InitializesStorageStructures(t *testing.T) {
 	}
 }
 
+func TestCreateTreeInvalidStates(t *testing.T) {
+	cleanTestDB(DB)
+	s := NewAdminStorage(DB)
+	ctx := context.Background()
+
+	states := []trillian.TreeState{trillian.TreeState_DRAINING, trillian.TreeState_FROZEN}
+
+	for _, state := range states {
+		inTree := proto.Clone(testonly.LogTree).(*trillian.Tree)
+		inTree.TreeState = state
+		if _, err := storage.CreateTree(ctx, s, inTree); err == nil {
+			t.Errorf("CreateTree() state: %v got: nil want: err", state)
+		}
+	}
+}
+
 func TestAdminTX_TreeWithNulls(t *testing.T) {
 	cleanTestDB(DB)
 	s := NewAdminStorage(DB)
@@ -68,21 +85,23 @@ func TestAdminTX_TreeWithNulls(t *testing.T) {
 	// Setup: create a tree and set all nullable columns to null.
 	// Some columns have to be manually updated, as it's not possible to set
 	// some proto fields to nil.
-	tree, err := createTreeInternal(ctx, s, testonly.LogTree)
+	tree, err := storage.CreateTree(ctx, s, testonly.LogTree)
 	if err != nil {
-		t.Fatalf("createTree() failed: %v", err)
+		t.Fatalf("CreateTree() failed: %v", err)
 	}
-	if err := setNulls(ctx, DB, tree.TreeId); err != nil {
+	treeID := tree.TreeId
+
+	if err := setNulls(ctx, DB, treeID); err != nil {
 		t.Fatalf("setNulls() = %v, want = nil", err)
 	}
 
 	tests := []struct {
 		desc string
-		fn   func(context.Context, storage.AdminTX, int64) error
+		fn   storage.AdminTXFunc
 	}{
 		{
 			desc: "GetTree",
-			fn: func(ctx context.Context, tx storage.AdminTX, treeID int64) error {
+			fn: func(ctx context.Context, tx storage.AdminTX) error {
 				_, err := tx.GetTree(ctx, treeID)
 				return err
 			},
@@ -91,8 +110,8 @@ func TestAdminTX_TreeWithNulls(t *testing.T) {
 			// ListTreeIDs *shouldn't* care about other columns, but let's test it just
 			// in case.
 			desc: "ListTreeIDs",
-			fn: func(ctx context.Context, tx storage.AdminTX, treeID int64) error {
-				ids, err := tx.ListTreeIDs(ctx)
+			fn: func(ctx context.Context, tx storage.AdminTX) error {
+				ids, err := tx.ListTreeIDs(ctx, false /* includeDeleted */)
 				if err != nil {
 					return err
 				}
@@ -106,8 +125,8 @@ func TestAdminTX_TreeWithNulls(t *testing.T) {
 		},
 		{
 			desc: "ListTrees",
-			fn: func(ctx context.Context, tx storage.AdminTX, treeID int64) error {
-				trees, err := tx.ListTrees(ctx)
+			fn: func(ctx context.Context, tx storage.AdminTX) error {
+				trees, err := tx.ListTrees(ctx, false /* includeDeleted */)
 				if err != nil {
 					return err
 				}
@@ -121,18 +140,8 @@ func TestAdminTX_TreeWithNulls(t *testing.T) {
 		},
 	}
 	for _, test := range tests {
-		tx, err := s.Begin(ctx)
-		if err != nil {
-			t.Errorf("%v: Begin() = (_, %v), want = (_, nil)", test.desc, err)
-			continue
-		}
-		defer tx.Close()
-		if err := test.fn(ctx, tx, tree.TreeId); err != nil {
+		if err := s.ReadWriteTransaction(ctx, test.fn); err != nil {
 			t.Errorf("%v: err = %v, want = nil", test.desc, err)
-			continue
-		}
-		if err := tx.Commit(); err != nil {
-			t.Fatalf("%v: Commit() = %v, want = nil", test.desc, err)
 		}
 	}
 }
@@ -158,18 +167,18 @@ func TestAdminTX_StorageSettingsNotSupported(t *testing.T) {
 			fn: func(s storage.AdminStorage) error {
 				tree := *testonly.LogTree
 				tree.StorageSettings = settings
-				_, err := createTreeInternal(ctx, s, &tree)
+				_, err := storage.CreateTree(ctx, s, &tree)
 				return err
 			},
 		},
 		{
 			desc: "UpdateTree",
 			fn: func(s storage.AdminStorage) error {
-				tree, err := createTreeInternal(ctx, s, testonly.LogTree)
+				tree, err := storage.CreateTree(ctx, s, testonly.LogTree)
 				if err != nil {
 					t.Fatalf("CreateTree() failed with err = %v", err)
 				}
-				_, err = updateTreeInternal(ctx, s, tree.TreeId, func(tree *trillian.Tree) { tree.StorageSettings = settings })
+				_, err = storage.UpdateTree(ctx, s, tree.TreeId, func(tree *trillian.Tree) { tree.StorageSettings = settings })
 				return err
 			},
 		},
@@ -178,6 +187,34 @@ func TestAdminTX_StorageSettingsNotSupported(t *testing.T) {
 		if err := test.fn(s); err == nil {
 			t.Errorf("%v: err = nil, want non-nil", test.desc)
 		}
+	}
+}
+
+func TestAdminTX_HardDeleteTree(t *testing.T) {
+	cleanTestDB(DB)
+	s := NewAdminStorage(DB)
+	ctx := context.Background()
+
+	tree, err := storage.CreateTree(ctx, s, testonly.LogTree)
+	if err != nil {
+		t.Fatalf("CreateTree() returned err = %v", err)
+	}
+
+	if err := s.ReadWriteTransaction(ctx, func(ctx context.Context, tx storage.AdminTX) error {
+		if _, err := tx.SoftDeleteTree(ctx, tree.TreeId); err != nil {
+			return err
+		}
+		return tx.HardDeleteTree(ctx, tree.TreeId)
+	}); err != nil {
+		t.Fatalf("ReadWriteTransaction() returned err = %v", err)
+	}
+
+	// Unlike the HardDelete tests on AdminStorageTester, here we have the chance to poke inside the
+	// database and check that the rows are gone, so let's do just that.
+	// If there's no record on Trees, then there can be no record in any of the dependent tables.
+	var name string
+	if err := DB.QueryRowContext(ctx, "SELECT DisplayName FROM Trees WHERE TreeId = ?", tree.TreeId).Scan(&name); err != sql.ErrNoRows {
+		t.Errorf("QueryRowContext() returned err = %v, want = %v", err, sql.ErrNoRows)
 	}
 }
 
@@ -200,38 +237,6 @@ func TestCheckDatabaseAccessible_OK(t *testing.T) {
 	if err := s.CheckDatabaseAccessible(ctx); err != nil {
 		t.Errorf("TestCheckDatabaseAccessible_OK got: %v, want: nil", err)
 	}
-}
-
-func createTreeInternal(ctx context.Context, s storage.AdminStorage, tree *trillian.Tree) (*trillian.Tree, error) {
-	tx, err := s.Begin(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Close()
-	newTree, err := tx.CreateTree(ctx, tree)
-	if err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	return newTree, nil
-}
-
-func updateTreeInternal(ctx context.Context, s storage.AdminStorage, treeID int64, fn func(*trillian.Tree)) (*trillian.Tree, error) {
-	tx, err := s.Begin(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Close()
-	newTree, err := tx.UpdateTree(ctx, treeID, fn)
-	if err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	return newTree, nil
 }
 
 func setNulls(ctx context.Context, db *sql.DB, treeID int64) error {

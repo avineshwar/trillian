@@ -32,7 +32,7 @@ type MetricFactory struct {
 
 // NewCounter creates a new Counter object backed by Prometheus.
 func (pmf MetricFactory) NewCounter(name, help string, labelNames ...string) monitoring.Counter {
-	if labelNames == nil || len(labelNames) == 0 {
+	if len(labelNames) == 0 {
 		counter := prometheus.NewCounter(
 			prometheus.CounterOpts{
 				Name: pmf.Prefix + name,
@@ -54,7 +54,7 @@ func (pmf MetricFactory) NewCounter(name, help string, labelNames ...string) mon
 
 // NewGauge creates a new Gauge object backed by Prometheus.
 func (pmf MetricFactory) NewGauge(name, help string, labelNames ...string) monitoring.Gauge {
-	if labelNames == nil || len(labelNames) == 0 {
+	if len(labelNames) == 0 {
 		gauge := prometheus.NewGauge(
 			prometheus.GaugeOpts{
 				Name: pmf.Prefix + name,
@@ -73,21 +73,35 @@ func (pmf MetricFactory) NewGauge(name, help string, labelNames ...string) monit
 	return &Gauge{labelNames: labelNames, vec: vec}
 }
 
-// NewHistogram creates a new Histogram object backed by Prometheus.
+// NewHistogramWithBuckets creates a new Histogram object backed by
+// Prometheus and using the supplied bucketing intervals. Note: the
+// number of buckets should be kept within reasonable bounds.
+func (pmf MetricFactory) NewHistogramWithBuckets(name, help string, buckets []float64, labelNames ...string) monitoring.Histogram {
+	return pmf.newHistogram(name, help, buckets, labelNames)
+}
+
+// NewHistogram creates a new Histogram object backed by Prometheus with
+// the supplied buckets.
 func (pmf MetricFactory) NewHistogram(name, help string, labelNames ...string) monitoring.Histogram {
-	if labelNames == nil || len(labelNames) == 0 {
+	return pmf.newHistogram(name, help, monitoring.LatencyBuckets(), labelNames)
+}
+
+func (pmf MetricFactory) newHistogram(name, help string, buckets []float64, labelNames []string) monitoring.Histogram {
+	if len(labelNames) == 0 {
 		histogram := prometheus.NewHistogram(
 			prometheus.HistogramOpts{
-				Name: pmf.Prefix + name,
-				Help: help,
+				Name:    pmf.Prefix + name,
+				Help:    help,
+				Buckets: buckets,
 			})
 		prometheus.MustRegister(histogram)
 		return &Histogram{single: histogram}
 	}
 	vec := prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
-			Name: pmf.Prefix + name,
-			Help: help,
+			Name:    pmf.Prefix + name,
+			Help:    help,
+			Buckets: buckets,
 		},
 		labelNames)
 	prometheus.MustRegister(vec)

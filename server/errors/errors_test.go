@@ -19,14 +19,13 @@ import (
 	"errors"
 	"testing"
 
-	te "github.com/google/trillian/errors"
+	_ "github.com/golang/glog"
 	"github.com/kylelemons/godebug/pretty"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
 func TestWrapError(t *testing.T) {
-	trillianErr := te.New(te.InvalidArgument, "invalid argument err")
 	grpcErr := status.Errorf(codes.NotFound, "not found err")
 	err := errors.New("generic error")
 
@@ -34,10 +33,6 @@ func TestWrapError(t *testing.T) {
 		err     error
 		wantErr error
 	}{
-		{
-			err:     trillianErr,
-			wantErr: status.Errorf(codes.InvalidArgument, trillianErr.Error()),
-		},
 		{
 			err:     grpcErr,
 			wantErr: grpcErr,

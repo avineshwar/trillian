@@ -16,18 +16,20 @@
 package monitoring
 
 import (
+	"context"
 	"fmt"
 	"time"
 
-	"github.com/google/trillian/util"
-	"golang.org/x/net/context"
+	"github.com/google/trillian/util/clock"
 	"google.golang.org/grpc"
 )
+
+const traceSpanRoot = "/trillian/mon/"
 
 // RPCStatsInterceptor provides a gRPC interceptor that records statistics about the RPCs passing through it.
 type RPCStatsInterceptor struct {
 	prefix            string
-	timeSource        util.TimeSource
+	timeSource        clock.TimeSource
 	ReqCount          Counter
 	ReqSuccessCount   Counter
 	ReqSuccessLatency Histogram
@@ -37,7 +39,10 @@ type RPCStatsInterceptor struct {
 
 // NewRPCStatsInterceptor creates a new RPCStatsInterceptor for the given application/component, with
 // a specified time source.
-func NewRPCStatsInterceptor(timeSource util.TimeSource, prefix string, mf MetricFactory) *RPCStatsInterceptor {
+func NewRPCStatsInterceptor(timeSource clock.TimeSource, prefix string, mf MetricFactory) *RPCStatsInterceptor {
+	if mf == nil {
+		mf = InertMetricFactory{}
+	}
 	interceptor := RPCStatsInterceptor{
 		prefix:            prefix,
 		timeSource:        timeSource,
@@ -55,7 +60,7 @@ func prefixedName(prefix, name string) string {
 }
 
 func (r *RPCStatsInterceptor) recordFailureLatency(labels []string, startTime time.Time) {
-	latency := r.timeSource.Now().Sub(startTime).Seconds()
+	latency := clock.SecondsSince(r.timeSource, startTime)
 	r.ReqErrorCount.Inc(labels...)
 	r.ReqErrorLatency.Observe(latency, labels...)
 }
@@ -65,6 +70,11 @@ func (r *RPCStatsInterceptor) recordFailureLatency(labels []string, startTime ti
 func (r *RPCStatsInterceptor) Interceptor() grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 		labels := []string{info.FullMethod}
+
+		// This interceptor wraps the request handler so we should track the
+		// additional latency it imposes.
+		ctx, spanEnd := StartSpan(ctx, traceSpanRoot)
+		defer spanEnd()
 
 		// Increase the request count for the method and start the clock
 		r.ReqCount.Inc(labels...)
@@ -85,7 +95,7 @@ func (r *RPCStatsInterceptor) Interceptor() grpc.UnaryServerInterceptor {
 		if err != nil {
 			r.recordFailureLatency(labels, startTime)
 		} else {
-			latency := r.timeSource.Now().Sub(startTime).Seconds()
+			latency := clock.SecondsSince(r.timeSource, startTime)
 			r.ReqSuccessCount.Inc(labels...)
 			r.ReqSuccessLatency.Observe(latency, labels...)
 		}

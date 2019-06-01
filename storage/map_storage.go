@@ -38,8 +38,20 @@ type ReadOnlyMapTX interface {
 // A ReadOnlyMapTreeTX can only read from the tree specified in its creation.
 type ReadOnlyMapTreeTX interface {
 	ReadOnlyTreeTX
-	MapRootReader
-	Getter
+
+	// GetSignedMapRoot returns the SignedMapRoot associated with the
+	// specified revision.
+	GetSignedMapRoot(ctx context.Context, revision int64) (trillian.SignedMapRoot, error)
+	// LatestSignedMapRoot returns the most recently created SignedMapRoot.
+	LatestSignedMapRoot(ctx context.Context) (trillian.SignedMapRoot, error)
+
+	// Get retrieves the values associated with the keyHashes, if any, at the
+	// specified revision.
+	// Setting revision to -1 will fetch the latest revision.
+	// The returned array of MapLeaves will only contain entries for which values
+	// exist.  i.e. requesting a set of unknown keys would result in a
+	// zero-length array being returned.
+	Get(ctx context.Context, revision int64, keyHashes [][]byte) ([]*trillian.MapLeaf, error)
 }
 
 // MapTreeTX is the transactional interface for reading/modifying a Map.
@@ -48,11 +60,13 @@ type ReadOnlyMapTreeTX interface {
 // released any resources owned by the MapTX.
 // A MapTreeTX can only read from the tree specified in its creation.
 type MapTreeTX interface {
-	TreeTX
-	MapRootReader
-	MapRootWriter
-	Getter
-	Setter
+	ReadOnlyMapTreeTX
+	TreeWriter
+
+	// StoreSignedMapRoot stores root.
+	StoreSignedMapRoot(ctx context.Context, root trillian.SignedMapRoot) error
+	// Set sets key to leaf
+	Set(ctx context.Context, keyHash []byte, value trillian.MapLeaf) error
 }
 
 // ReadOnlyMapStorage provides a narrow read-only view into a MapStorage.
@@ -66,47 +80,19 @@ type ReadOnlyMapStorage interface {
 	// Commit must be called when the caller is finished with the returned object,
 	// and values read through it should only be propagated if Commit returns
 	// without error.
-	SnapshotForTree(ctx context.Context, treeID int64) (ReadOnlyMapTreeTX, error)
+	SnapshotForTree(ctx context.Context, tree *trillian.Tree) (ReadOnlyMapTreeTX, error)
 }
+
+// MapTXFunc is the func signature for passing into ReadWriteTransaction.
+type MapTXFunc func(context.Context, MapTreeTX) error
 
 // MapStorage should be implemented by concrete storage mechanisms which want to support Maps
 type MapStorage interface {
 	ReadOnlyMapStorage
-	// BeginForTree starts a new Map transaction.
-	// Either Commit or Rollback must be called when the caller is finished with
-	// the returned object, and values read through it should only be propagated
-	// if Commit returns without error.
-	BeginForTree(ctx context.Context, treeID int64) (MapTreeTX, error)
-}
 
-// Setter allows the setting of key->value pairs on the map.
-type Setter interface {
-	// Set sets key to leaf
-	Set(ctx context.Context, keyHash []byte, value trillian.MapLeaf) error
-}
-
-// Getter allows access to the values stored in the map.
-type Getter interface {
-	// Get retrieves the values associates with the keyHashes, if any, at the
-	// specified revision.
-	// Setting revision to -1 will fetch the latest revision.
-	// The returned array of MapLeaves will only contain entries for which values
-	// exist.  i.e. requesting a set of unknown keys would result in a
-	// zero-length array being returned.
-	Get(ctx context.Context, revision int64, keyHashes [][]byte) ([]trillian.MapLeaf, error)
-}
-
-// MapRootReader provides access to the map roots.
-type MapRootReader interface {
-	// GetSignedMapRoot returns the SignedMapRoot associated with the
-	// specified revision.
-	GetSignedMapRoot(ctx context.Context, revision int64) (trillian.SignedMapRoot, error)
-	// LatestSignedMapRoot returns the most recently created SignedMapRoot.
-	LatestSignedMapRoot(ctx context.Context) (trillian.SignedMapRoot, error)
-}
-
-// MapRootWriter allows the storage of new SignedMapRoots
-type MapRootWriter interface {
-	// StoreSignedMapRoot stores root.
-	StoreSignedMapRoot(ctx context.Context, root trillian.SignedMapRoot) error
+	// ReadWriteTransaction starts a RW transaction on the underlying storage, and
+	// calls f with it.
+	// If f fails and returns an error, the storage implementation may optionally
+	// retry with a new transaction, and f MUST NOT keep state across calls.
+	ReadWriteTransaction(ctx context.Context, tree *trillian.Tree, f MapTXFunc) error
 }

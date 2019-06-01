@@ -31,6 +31,7 @@ import (
 	"github.com/golang/protobuf/proto"
 	"github.com/golang/protobuf/ptypes"
 	"github.com/golang/protobuf/ptypes/empty"
+	"github.com/golang/protobuf/ptypes/timestamp"
 	"github.com/google/trillian"
 	"github.com/google/trillian/crypto/keys"
 	"github.com/google/trillian/crypto/keys/der"
@@ -43,30 +44,9 @@ import (
 	"google.golang.org/genproto/protobuf/field_mask"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-)
 
-func TestServer_Unimplemented(t *testing.T) {
-	tests := []struct {
-		desc string
-		fn   func(context.Context, *Server) error
-	}{
-		{
-			desc: "DeleteTree",
-			fn: func(ctx context.Context, s *Server) error {
-				_, err := s.DeleteTree(ctx, &trillian.DeleteTreeRequest{})
-				return err
-			},
-		},
-	}
-	ctx := context.Background()
-	s := &Server{}
-	for _, test := range tests {
-		err := test.fn(ctx, s)
-		if s, ok := status.FromError(err); !ok || s.Code() != codes.Unimplemented {
-			t.Errorf("%v: got = %v, want = %s", test.desc, err, codes.Unimplemented)
-		}
-	}
-}
+	ttestonly "github.com/google/trillian/testonly"
+)
 
 func TestServer_BeginError(t *testing.T) {
 	ctrl := gomock.NewController(t)
@@ -84,11 +64,7 @@ func TestServer_BeginError(t *testing.T) {
 	validTree.PublicKey = nil
 
 	keyProto := &empty.Empty{}
-	validTree.PrivateKey, err = ptypes.MarshalAny(keyProto)
-	if err != nil {
-		t.Fatalf("Error marshaling key proto as protobuf Any: %v", err)
-	}
-
+	validTree.PrivateKey = ttestonly.MustMarshalAny(t, keyProto)
 	keys.RegisterHandler(fakeKeyProtoHandler(keyProto, privateKey))
 	defer keys.UnregisterHandler(keyProto)
 
@@ -126,9 +102,9 @@ func TestServer_BeginError(t *testing.T) {
 	for _, test := range tests {
 		as := storage.NewMockAdminStorage(ctrl)
 		if test.snapshot {
-			as.EXPECT().Snapshot(ctx).Return(nil, errors.New("snapshot error"))
+			as.EXPECT().Snapshot(gomock.Any()).Return(nil, errors.New("snapshot error"))
 		} else {
-			as.EXPECT().Begin(ctx).Return(nil, errors.New("begin error"))
+			as.EXPECT().ReadWriteTransaction(gomock.Any(), gomock.Any()).Return(errors.New("begin error"))
 		}
 
 		registry := extension.Registry{
@@ -146,89 +122,113 @@ func TestServer_ListTrees(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
+	activeLog := proto.Clone(testonly.LogTree).(*trillian.Tree)
+	frozenLog := proto.Clone(testonly.LogTree).(*trillian.Tree)
+	frozenLog.TreeState = trillian.TreeState_FROZEN
+	deletedLog := proto.Clone(testonly.LogTree).(*trillian.Tree)
+	activeMap := proto.Clone(testonly.MapTree).(*trillian.Tree)
+	deletedMap := proto.Clone(testonly.MapTree).(*trillian.Tree)
+
+	id := int64(17)
+	nowPB := ptypes.TimestampNow()
+	for _, tree := range []*trillian.Tree{activeLog, frozenLog, deletedLog, activeMap, deletedMap} {
+		tree.TreeId = id
+		tree.CreateTime = proto.Clone(nowPB).(*timestamp.Timestamp)
+		tree.UpdateTime = proto.Clone(nowPB).(*timestamp.Timestamp)
+		id++
+		nowPB.Seconds++
+	}
+	for _, tree := range []*trillian.Tree{deletedLog, deletedMap} {
+		tree.Deleted = true
+		tree.DeleteTime = proto.Clone(nowPB).(*timestamp.Timestamp)
+		nowPB.Seconds++
+	}
+	nonDeletedTrees := []*trillian.Tree{activeLog, frozenLog, activeMap}
+	allTrees := []*trillian.Tree{activeLog, frozenLog, deletedLog, activeMap, deletedMap}
+
 	tests := []struct {
-		desc string
-		// numTrees is the number of trees in storage. New trees are created as necessary
-		// and carried over to following tests.
-		numTrees           int
-		listErr, commitErr bool
+		desc  string
+		req   *trillian.ListTreesRequest
+		trees []*trillian.Tree
 	}{
-		{desc: "empty"},
-		{desc: "listErr", listErr: true},
-		{desc: "commitErr", commitErr: true},
-		{desc: "oneTree", numTrees: 1},
-		{desc: "threeTrees", numTrees: 3},
+		{desc: "emptyNonDeleted", req: &trillian.ListTreesRequest{}},
+		{desc: "empty", req: &trillian.ListTreesRequest{ShowDeleted: true}},
+		{desc: "nonDeleted", req: &trillian.ListTreesRequest{}, trees: nonDeletedTrees},
+		{
+			desc:  "allTreesDeleted",
+			req:   &trillian.ListTreesRequest{ShowDeleted: true},
+			trees: allTrees,
+		},
 	}
 
 	ctx := context.Background()
-	nextTreeID := int64(17)
-	storedTrees := []*trillian.Tree{}
-	nowPB, _ := ptypes.TimestampProto(time.Now())
 	for _, test := range tests {
-		if l := len(storedTrees); l > test.numTrees {
-			t.Fatalf("%v: numTrees = %v, but we already have %v stored trees", test.desc, test.numTrees, l)
-		} else {
-			for i := l; i < test.numTrees; i++ {
-				newTree := *testonly.LogTree
-				newTree.TreeId = nextTreeID
-				newTree.CreateTime = nowPB
-				newTree.UpdateTime = nowPB
-				nextTreeID++
-				storedTrees = append(storedTrees, &newTree)
-			}
-		}
-
 		setup := setupAdminServer(
 			ctrl,
-			nil,           // keygen
-			true,          // snapshot
-			!test.listErr, // shouldCommit
-			test.commitErr)
+			nil,  /* keygen */
+			true, /* snapshot */
+			true, /* shouldCommit */
+			false /* commitErr */)
+
 		tx := setup.snapshotTX
+		tx.EXPECT().ListTrees(gomock.Any(), test.req.ShowDeleted).Return(test.trees, nil)
+
 		s := setup.server
-
-		if test.listErr {
-			tx.EXPECT().ListTrees(ctx).Return(nil, errors.New("error listing trees"))
-		} else {
-			// Take a defensive copy, otherwise the server may end up changing our
-			// source-of-truth trees.
-			trees := copyAndUpdate(storedTrees, func(*trillian.Tree) {})
-			tx.EXPECT().ListTrees(ctx).Return(trees, nil)
-		}
-
-		resp, err := s.ListTrees(ctx, &trillian.ListTreesRequest{})
-		if hasErr, wantErr := err != nil, test.listErr || test.commitErr; hasErr != wantErr {
-			t.Errorf("%v: ListTrees() = (_, %q), wantErr = %v", test.desc, err, wantErr)
-			continue
-		} else if hasErr {
+		resp, err := s.ListTrees(ctx, test.req)
+		if err != nil {
+			t.Errorf("%v: ListTrees() returned err = %v", test.desc, err)
 			continue
 		}
-
-		want := copyAndUpdate(storedTrees, func(t *trillian.Tree) { t.PrivateKey = nil })
-		if diff := pretty.Compare(resp.Tree, want); diff != "" {
-			t.Errorf("%v: post-ListTrees diff (-got +want):\n%v", test.desc, diff)
+		want := []*trillian.Tree{}
+		for _, tree := range test.trees {
+			wantTree := proto.Clone(tree).(*trillian.Tree)
+			wantTree.PrivateKey = nil // redacted
+			want = append(want, wantTree)
+		}
+		for i, wantTree := range want {
+			if !proto.Equal(resp.Tree[i], wantTree) {
+				t.Errorf("%v: post-ListTrees() diff (-got +want):\n%v", test.desc, pretty.Compare(resp.Tree, want))
+				break
+			}
 		}
 	}
 }
 
-// copyAndUpdate makes a deep copy of a slice, allowing for an optional redact function to run on
-// every element.
-func copyAndUpdate(s []*trillian.Tree, f func(*trillian.Tree)) []*trillian.Tree {
-	otherS := make([]*trillian.Tree, 0, len(s))
-	for _, t := range s {
-		otherT := *t
-		f(&otherT)
-		otherS = append(otherS, &otherT)
+func TestServer_ListTreesErrors(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	tests := []struct {
+		desc      string
+		listErr   error
+		commitErr bool
+	}{
+		{desc: "listErr", listErr: errors.New("error listing trees")},
+		{desc: "commitErr", commitErr: true},
 	}
-	return otherS
+
+	ctx := context.Background()
+	for _, test := range tests {
+		setup := setupAdminServer(
+			ctrl,
+			nil,                 /* keygen */
+			true,                /* snapshot */
+			test.listErr == nil, /* shouldCommit */
+			test.commitErr /* commitErr */)
+
+		tx := setup.snapshotTX
+		tx.EXPECT().ListTrees(gomock.Any(), false).Return(nil, test.listErr)
+
+		s := setup.server
+		if _, err := s.ListTrees(ctx, &trillian.ListTreesRequest{}); err == nil {
+			t.Errorf("%v: ListTrees() returned err = nil, want non-nil", test.desc)
+		}
+	}
 }
 
 func TestServer_GetTree(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
-
-	invalidTree := *testonly.LogTree
-	invalidTree.TreeState = trillian.TreeState_HARD_DELETED
 
 	tests := []struct {
 		desc              string
@@ -262,9 +262,9 @@ func TestServer_GetTree(t *testing.T) {
 		storedTree := *testonly.LogTree
 		storedTree.TreeId = 12345
 		if test.getErr {
-			tx.EXPECT().GetTree(ctx, storedTree.TreeId).Return(nil, errors.New("GetTree failed"))
+			tx.EXPECT().GetTree(gomock.Any(), storedTree.TreeId).Return(nil, errors.New("GetTree failed"))
 		} else {
-			tx.EXPECT().GetTree(ctx, storedTree.TreeId).Return(&storedTree, nil)
+			tx.EXPECT().GetTree(gomock.Any(), storedTree.TreeId).Return(&storedTree, nil)
 		}
 		wantErr := test.getErr || test.commitErr
 
@@ -285,9 +285,6 @@ func TestServer_GetTree(t *testing.T) {
 }
 
 func TestServer_CreateTree(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-
 	// PEM on the testonly trees is ECDSA, so let's use an ECDSA key for tests.
 	ecdsaPrivateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -304,10 +301,7 @@ func TestServer_CreateTree(t *testing.T) {
 	// Except in key generation test cases, a keys.ProtoHandler will be registered that
 	// returns ecdsaPrivateKey when passed an empty proto.
 	wantKeyProto := &empty.Empty{}
-	validTree.PrivateKey, err = ptypes.MarshalAny(wantKeyProto)
-	if err != nil {
-		t.Fatalf("Error marshaling private key proto as protobuf Any: %v", err)
-	}
+	validTree.PrivateKey = ttestonly.MustMarshalAny(t, wantKeyProto)
 	validTree.PublicKey = func() *keyspb.PublicKey {
 		pb, err := der.ToPublicProto(ecdsaPrivateKey.Public())
 		if err != nil {
@@ -329,7 +323,7 @@ func TestServer_CreateTree(t *testing.T) {
 	omittedKeys.PrivateKey = nil
 
 	invalidTree := validTree
-	invalidTree.TreeState = trillian.TreeState_HARD_DELETED
+	invalidTree.TreeState = trillian.TreeState_UNKNOWN_TREE_STATE
 
 	invalidHashAlgo := validTree
 	invalidHashAlgo.HashAlgorithm = sigpb.DigitallySigned_NONE
@@ -468,71 +462,158 @@ func TestServer_CreateTree(t *testing.T) {
 
 	ctx := context.Background()
 	for _, test := range tests {
-		var privateKey crypto.Signer = ecdsaPrivateKey
-		var keygen keys.ProtoGenerator
-		// If KeySpec is set, select the correct type of key to "generate".
-		if test.req.GetKeySpec() != nil {
-			switch keySpec := test.req.GetKeySpec().GetParams().(type) {
-			case *keyspb.Specification_EcdsaParams:
-				privateKey = ecdsaPrivateKey
-			case *keyspb.Specification_RsaParams:
-				privateKey = rsaPrivateKey
-			default:
-				t.Errorf("%v: unexpected KeySpec.Params type: %T", test.desc, keySpec)
-				continue
+		t.Run(test.desc, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+
+			var privateKey crypto.Signer = ecdsaPrivateKey
+			var keygen keys.ProtoGenerator
+			// If KeySpec is set, select the correct type of key to "generate".
+			if test.req.GetKeySpec() != nil {
+				switch keySpec := test.req.GetKeySpec().GetParams().(type) {
+				case *keyspb.Specification_EcdsaParams:
+					privateKey = ecdsaPrivateKey
+				case *keyspb.Specification_RsaParams:
+					privateKey = rsaPrivateKey
+				default:
+					t.Fatalf("unexpected KeySpec.Params type: %T", keySpec)
+				}
+
+				if test.wantKeyGenerator {
+					// Setup a fake key generator. If it receives the expected KeySpec, it returns wantKeyProto,
+					// which a keys.ProtoHandler will expect to receive later on.
+					keygen = fakeKeyProtoGenerator(test.req.GetKeySpec(), wantKeyProto)
+				}
 			}
 
-			if test.wantKeyGenerator {
-				// Setup a fake key generator. If it receives the expected KeySpec, it returns wantKeyProto,
-				// which a keys.ProtoHandler will expect to receive later on.
-				keygen = fakeKeyProtoGenerator(test.req.GetKeySpec(), wantKeyProto)
+			keys.RegisterHandler(fakeKeyProtoHandler(wantKeyProto, privateKey))
+			defer keys.UnregisterHandler(wantKeyProto)
+
+			setup := setupAdminServer(ctrl, keygen, false /* snapshot */, test.wantCommit, test.commitErr)
+			tx := setup.tx
+			s := setup.server
+			nowPB := ptypes.TimestampNow()
+
+			if test.req.Tree != nil {
+				var newTree trillian.Tree
+				tx.EXPECT().CreateTree(gomock.Any(), gomock.Any()).MaxTimes(1).Do(func(ctx context.Context, tree *trillian.Tree) {
+					newTree = *tree
+					newTree.TreeId = 12345
+					newTree.CreateTime = nowPB
+					newTree.UpdateTime = nowPB
+				}).Return(&newTree, test.createErr)
 			}
-		}
 
-		keys.RegisterHandler(fakeKeyProtoHandler(wantKeyProto, privateKey))
-		defer keys.UnregisterHandler(wantKeyProto)
+			// Copy test.req so that any changes CreateTree makes don't affect the original, which may be shared between tests.
+			reqCopy := proto.Clone(test.req).(*trillian.CreateTreeRequest)
+			tree, err := s.CreateTree(ctx, reqCopy)
+			switch gotErr := err != nil; {
+			case gotErr && !strings.Contains(err.Error(), test.wantErr):
+				t.Fatalf("CreateTree() = (_, %q), want (_, %q)", err, test.wantErr)
+			case gotErr:
+				return
+			case test.wantErr != "":
+				t.Fatalf("CreateTree() = (_, nil), want (_, %q)", test.wantErr)
+			}
 
-		setup := setupAdminServer(ctrl, keygen, false /* snapshot */, test.wantCommit, test.commitErr)
-		tx := setup.tx
+			wantTree := *test.req.Tree
+			wantTree.TreeId = 12345
+			wantTree.CreateTime = nowPB
+			wantTree.UpdateTime = nowPB
+			wantTree.PrivateKey = nil // redacted
+			wantTree.PublicKey, err = der.ToPublicProto(privateKey.Public())
+			if err != nil {
+				t.Fatalf("failed to marshal test public key as protobuf: %v", err)
+			}
+			if diff := pretty.Compare(tree, &wantTree); diff != "" {
+				t.Fatalf("post-CreateTree diff (-got +want):\n%v", diff)
+			}
+		})
+	}
+}
+
+func TestServer_CreateTree_AllowedTreeTypes(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	tests := []struct {
+		desc      string
+		treeTypes []trillian.TreeType
+		req       *trillian.CreateTreeRequest
+		wantCode  codes.Code
+		wantMsg   string
+	}{
+		{
+			desc:      "mapOnLogServer",
+			treeTypes: []trillian.TreeType{trillian.TreeType_LOG},
+			req:       &trillian.CreateTreeRequest{Tree: testonly.MapTree},
+			wantCode:  codes.InvalidArgument,
+			wantMsg:   "tree type MAP not allowed",
+		},
+		{
+			desc:      "logOnMapServer",
+			treeTypes: []trillian.TreeType{trillian.TreeType_MAP},
+			req:       &trillian.CreateTreeRequest{Tree: testonly.LogTree},
+			wantCode:  codes.InvalidArgument,
+			wantMsg:   "tree type LOG not allowed",
+		},
+		{
+			desc:      "preorderedLogOnLogServer",
+			treeTypes: []trillian.TreeType{trillian.TreeType_LOG},
+			req:       &trillian.CreateTreeRequest{Tree: testonly.PreorderedLogTree},
+			wantCode:  codes.InvalidArgument,
+			wantMsg:   "tree type PREORDERED_LOG not allowed",
+		},
+		{
+			desc:      "preorderedLogOnMapServer",
+			treeTypes: []trillian.TreeType{trillian.TreeType_MAP},
+			req:       &trillian.CreateTreeRequest{Tree: testonly.PreorderedLogTree},
+			wantCode:  codes.InvalidArgument,
+			wantMsg:   "tree type PREORDERED_LOG not allowed",
+		},
+		{
+			desc:      "logOnLogServer",
+			treeTypes: []trillian.TreeType{trillian.TreeType_LOG},
+			req:       &trillian.CreateTreeRequest{Tree: testonly.LogTree},
+			wantCode:  codes.OK,
+		},
+		{
+			desc:      "preorderedLogAllowed",
+			treeTypes: []trillian.TreeType{trillian.TreeType_LOG, trillian.TreeType_PREORDERED_LOG},
+			req:       &trillian.CreateTreeRequest{Tree: testonly.PreorderedLogTree},
+			wantCode:  codes.OK,
+		},
+		{
+			desc:      "mapOnMapServer",
+			treeTypes: []trillian.TreeType{trillian.TreeType_MAP},
+			req:       &trillian.CreateTreeRequest{Tree: testonly.MapTree},
+			wantCode:  codes.OK,
+		},
+		// treeTypes = nil is exercised by all other tests.
+	}
+
+	ctx := context.Background()
+	for _, test := range tests {
+		setup := setupAdminServer(
+			ctrl,
+			nil,   // keygen
+			false, // snapshot
+			test.wantCode == codes.OK,
+			false)
 		s := setup.server
-		nowPB, _ := ptypes.TimestampProto(time.Now())
+		tx := setup.tx
+		s.allowedTreeTypes = test.treeTypes
 
-		if test.req.Tree != nil {
-			var newTree trillian.Tree
-			tx.EXPECT().CreateTree(ctx, gomock.Any()).MaxTimes(1).Do(func(ctx context.Context, tree *trillian.Tree) {
-				newTree = *tree
-				newTree.TreeId = 12345
-				newTree.CreateTime = nowPB
-				newTree.UpdateTime = nowPB
-			}).Return(&newTree, test.createErr)
-		}
+		// Storage interactions aren't the focus of this test, so mocks are configured in a rather
+		// permissive way.
+		tx.EXPECT().CreateTree(gomock.Any(), gomock.Any()).AnyTimes().Return(&trillian.Tree{}, nil)
 
-		// Copy test.req so that any changes CreateTree makes don't affect the original, which may be shared between tests.
-		reqCopy := proto.Clone(test.req).(*trillian.CreateTreeRequest)
-		tree, err := s.CreateTree(ctx, reqCopy)
-		switch gotErr := err != nil; {
-		case gotErr && !strings.Contains(err.Error(), test.wantErr):
-			t.Errorf("%v: CreateTree() = (_, %q), want (_, %q)", test.desc, err, test.wantErr)
-			continue
-		case gotErr:
-			continue
-		case test.wantErr != "":
-			t.Errorf("%v: CreateTree() = (_, nil), want (_, %q)", test.desc, test.wantErr)
-			continue
-		}
-
-		wantTree := *test.req.Tree
-		wantTree.TreeId = 12345
-		wantTree.CreateTime = nowPB
-		wantTree.UpdateTime = nowPB
-		wantTree.PrivateKey = nil // redacted
-		wantTree.PublicKey, err = der.ToPublicProto(privateKey.Public())
-		if err != nil {
-			t.Errorf("%v: failed to marshal test public key as protobuf: %v", test.desc, err)
-			continue
-		}
-		if diff := pretty.Compare(tree, &wantTree); diff != "" {
-			t.Errorf("%v: post-CreateTree diff (-got +want):\n%v", test.desc, diff)
+		_, err := s.CreateTree(ctx, test.req)
+		switch s, ok := status.FromError(err); {
+		case !ok || s.Code() != test.wantCode:
+			t.Errorf("%v: CreateTree() returned err = %v, wantCode = %s", test.desc, err, test.wantCode)
+		case err != nil && !strings.Contains(err.Error(), test.wantMsg):
+			t.Errorf("%v: CreateTree() returned err = %q, wantMsg = %q", test.desc, err, test.wantMsg)
 		}
 	}
 }
@@ -541,7 +622,7 @@ func TestServer_UpdateTree(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	nowPB, _ := ptypes.TimestampProto(time.Now())
+	nowPB := ptypes.TimestampNow()
 	existingTree := *testonly.LogTree
 	existingTree.TreeId = 12345
 	existingTree.CreateTime = nowPB
@@ -549,10 +630,7 @@ func TestServer_UpdateTree(t *testing.T) {
 	existingTree.MaxRootDuration = ptypes.DurationProto(1 * time.Nanosecond)
 
 	// Any valid proto works here, the type doesn't matter for this test.
-	settings, err := ptypes.MarshalAny(&keyspb.PEMKeyFile{})
-	if err != nil {
-		t.Fatalf("Error marshaling proto: %v", err)
-	}
+	settings := ttestonly.MustMarshalAny(t, &empty.Empty{})
 
 	// successTree specifies changes in all rw fields
 	successTree := &trillian.Tree{
@@ -561,8 +639,11 @@ func TestServer_UpdateTree(t *testing.T) {
 		Description:     "Brand New Tree Desc",
 		StorageSettings: settings,
 		MaxRootDuration: ptypes.DurationProto(2 * time.Nanosecond),
+		PrivateKey:      ttestonly.MustMarshalAny(t, &empty.Empty{}),
 	}
-	successMask := &field_mask.FieldMask{Paths: []string{"tree_state", "display_name", "description", "storage_settings", "max_root_duration"}}
+	successMask := &field_mask.FieldMask{
+		Paths: []string{"tree_state", "display_name", "description", "storage_settings", "max_root_duration", "private_key"},
+	}
 
 	successWant := existingTree
 	successWant.TreeState = successTree.TreeState
@@ -642,7 +723,10 @@ func TestServer_UpdateTree(t *testing.T) {
 		s := setup.server
 
 		if test.req.Tree != nil {
-			tx.EXPECT().UpdateTree(ctx, test.req.Tree.TreeId, gomock.Any()).MaxTimes(1).Return(test.currentTree, test.updateErr)
+			tx.EXPECT().UpdateTree(gomock.Any(), test.req.Tree.TreeId, gomock.Any()).MaxTimes(1).Do(func(ctx context.Context, treeID int64, updateFn func(*trillian.Tree)) {
+				// This step should be done by the storage layer, but since we're mocking it we have to trigger it ourselves.
+				updateFn(test.currentTree)
+			}).Return(test.currentTree, test.updateErr)
 		}
 
 		tree, err := s.UpdateTree(ctx, test.req)
@@ -653,15 +737,178 @@ func TestServer_UpdateTree(t *testing.T) {
 			continue
 		}
 
-		// This step should be done by the storage layer, but since we're mocking it we have
-		// to trigger it ourselves. Ideally the mock would do it on UpdateTree.
-		if err := applyUpdateMask(test.req.Tree, tree, test.req.UpdateMask); err != nil {
-			t.Errorf("%v: applyUpdateMask returned err = %v", test.desc, err)
-			continue
-		}
 		if !proto.Equal(tree, test.wantTree) {
 			diff := pretty.Compare(tree, test.wantTree)
 			t.Errorf("%v: post-UpdateTree diff:\n%v", test.desc, diff)
+		}
+	}
+}
+
+func TestServer_DeleteTree(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	logTree := proto.Clone(testonly.LogTree).(*trillian.Tree)
+	mapTree := proto.Clone(testonly.MapTree).(*trillian.Tree)
+	for i, tree := range []*trillian.Tree{logTree, mapTree} {
+		tree.TreeId = int64(i) + 10
+		tree.CreateTime, _ = ptypes.TimestampProto(time.Unix(int64(i)*3600, 0))
+		tree.UpdateTime = tree.CreateTime
+	}
+
+	tests := []struct {
+		desc string
+		tree *trillian.Tree
+	}{
+		{desc: "logTree", tree: logTree},
+		{desc: "mapTree", tree: mapTree},
+	}
+
+	ctx := context.Background()
+	for _, test := range tests {
+		setup := setupAdminServer(
+			ctrl,
+			nil,   /* keygen */
+			false, /* snapshot */
+			true,  /* shouldCommit */
+			false)
+		req := &trillian.DeleteTreeRequest{TreeId: test.tree.TreeId}
+
+		tx := setup.tx
+		tx.EXPECT().SoftDeleteTree(gomock.Any(), req.TreeId).Return(test.tree, nil)
+
+		s := setup.server
+		got, err := s.DeleteTree(ctx, req)
+		if err != nil {
+			t.Errorf("%v: DeleteTree() returned err = %v", test.desc, err)
+			continue
+		}
+
+		want := proto.Clone(test.tree).(*trillian.Tree)
+		want.PrivateKey = nil // redacted
+		if !proto.Equal(got, want) {
+			diff := pretty.Compare(got, want)
+			t.Errorf("%v: post-DeleteTree() diff (-got +want):\n%v", test.desc, diff)
+		}
+	}
+}
+
+func TestServer_DeleteTreeErrors(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	tests := []struct {
+		desc      string
+		deleteErr error
+		commitErr bool
+	}{
+		{desc: "deleteErr", deleteErr: errors.New("unknown tree")},
+		{desc: "commitErr", commitErr: true},
+	}
+
+	ctx := context.Background()
+	for _, test := range tests {
+		setup := setupAdminServer(
+			ctrl,
+			nil,
+			false,
+			test.deleteErr == nil,
+			test.commitErr)
+		req := &trillian.DeleteTreeRequest{TreeId: 10}
+
+		tx := setup.tx
+		tx.EXPECT().SoftDeleteTree(gomock.Any(), req.TreeId).Return(&trillian.Tree{}, test.deleteErr)
+
+		s := setup.server
+		if _, err := s.DeleteTree(ctx, req); err == nil {
+			t.Errorf("%v: DeleteTree() returned err = nil, want non-nil", test.desc)
+		}
+	}
+}
+
+func TestServer_UndeleteTree(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	activeLog := proto.Clone(testonly.LogTree).(*trillian.Tree)
+	frozenLog := proto.Clone(testonly.LogTree).(*trillian.Tree)
+	frozenLog.TreeState = trillian.TreeState_FROZEN
+	activeMap := proto.Clone(testonly.MapTree).(*trillian.Tree)
+	for i, tree := range []*trillian.Tree{activeLog, frozenLog, activeMap} {
+		tree.TreeId = int64(i) + 10
+		tree.CreateTime, _ = ptypes.TimestampProto(time.Unix(int64(i)*3600, 0))
+		tree.UpdateTime = tree.CreateTime
+		tree.Deleted = true
+		tree.DeleteTime, _ = ptypes.TimestampProto(time.Unix(int64(i)*3600+10, 0))
+	}
+
+	tests := []struct {
+		desc string
+		tree *trillian.Tree
+	}{
+		{desc: "activeLog", tree: activeLog},
+		{desc: "frozenLog", tree: frozenLog},
+		{desc: "activeMap", tree: activeMap},
+	}
+
+	ctx := context.Background()
+	for _, test := range tests {
+		setup := setupAdminServer(
+			ctrl,
+			nil,   /* keygen */
+			false, /* snapshot */
+			true,  /* shouldCommit */
+			false)
+		req := &trillian.UndeleteTreeRequest{TreeId: test.tree.TreeId}
+
+		tx := setup.tx
+		tx.EXPECT().UndeleteTree(gomock.Any(), req.TreeId).Return(test.tree, nil)
+
+		s := setup.server
+		got, err := s.UndeleteTree(ctx, req)
+		if err != nil {
+			t.Errorf("%v: UndeleteTree() returned err = %v", test.desc, err)
+			continue
+		}
+
+		want := proto.Clone(test.tree).(*trillian.Tree)
+		want.PrivateKey = nil // redacted
+		if !proto.Equal(got, want) {
+			diff := pretty.Compare(got, want)
+			t.Errorf("%v: post-UneleteTree() diff (-got +want):\n%v", test.desc, diff)
+		}
+	}
+}
+
+func TestServer_UndeleteTreeErrors(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	tests := []struct {
+		desc        string
+		undeleteErr error
+		commitErr   bool
+	}{
+		{desc: "undeleteErr", undeleteErr: errors.New("unknown tree")},
+		{desc: "commitErr", commitErr: true},
+	}
+
+	ctx := context.Background()
+	for _, test := range tests {
+		setup := setupAdminServer(
+			ctrl,
+			nil,
+			false,
+			test.undeleteErr == nil,
+			test.commitErr)
+		req := &trillian.UndeleteTreeRequest{TreeId: 10}
+
+		tx := setup.tx
+		tx.EXPECT().UndeleteTree(gomock.Any(), req.TreeId).Return(&trillian.Tree{}, test.undeleteErr)
+
+		s := setup.server
+		if _, err := s.UndeleteTree(ctx, req); err == nil {
+			t.Errorf("%v: UndeleteTree() returned err = nil, want non-nil", test.desc)
 		}
 	}
 }
@@ -670,7 +917,7 @@ func TestServer_UpdateTree(t *testing.T) {
 // It's created via setupAdminServer.
 type adminTestSetup struct {
 	registry   extension.Registry
-	as         *storage.MockAdminStorage
+	as         storage.AdminStorage
 	tx         *storage.MockAdminTX
 	snapshotTX *storage.MockReadOnlyAdminTX
 	server     *Server
@@ -681,14 +928,14 @@ type adminTestSetup struct {
 // Whether the snapshot/TX is expected to be committed (and if it should error doing so) is
 // controlled via shouldCommit and commitErr parameters.
 func setupAdminServer(ctrl *gomock.Controller, keygen keys.ProtoGenerator, snapshot, shouldCommit, commitErr bool) adminTestSetup {
-	as := storage.NewMockAdminStorage(ctrl)
+	as := &testonly.FakeAdminStorage{}
 
 	var snapshotTX *storage.MockReadOnlyAdminTX
 	var tx *storage.MockAdminTX
 	if snapshot {
 		snapshotTX = storage.NewMockReadOnlyAdminTX(ctrl)
-		as.EXPECT().Snapshot(gomock.Any()).MaxTimes(1).Return(snapshotTX, nil)
 		snapshotTX.EXPECT().Close().MaxTimes(1).Return(nil)
+		as.ReadOnlyTX = append(as.ReadOnlyTX, snapshotTX)
 		if shouldCommit {
 			if commitErr {
 				snapshotTX.EXPECT().Commit().Return(errors.New("commit error"))
@@ -698,8 +945,8 @@ func setupAdminServer(ctrl *gomock.Controller, keygen keys.ProtoGenerator, snaps
 		}
 	} else {
 		tx = storage.NewMockAdminTX(ctrl)
-		as.EXPECT().Begin(gomock.Any()).MaxTimes(1).Return(tx, nil)
 		tx.EXPECT().Close().MaxTimes(1).Return(nil)
+		as.TX = append(as.TX, tx)
 		if shouldCommit {
 			if commitErr {
 				tx.EXPECT().Commit().Return(errors.New("commit error"))
@@ -714,7 +961,7 @@ func setupAdminServer(ctrl *gomock.Controller, keygen keys.ProtoGenerator, snaps
 		NewKeyProto:  keygen,
 	}
 
-	s := &Server{registry}
+	s := &Server{registry: registry}
 
 	return adminTestSetup{registry, as, tx, snapshotTX, s}
 }

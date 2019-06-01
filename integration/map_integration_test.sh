@@ -3,34 +3,37 @@ set -e
 INTEGRATION_DIR="$( cd "$( dirname "$0" )" && pwd )"
 . "${INTEGRATION_DIR}"/functions.sh
 
-echo "Building code"
-go build ${GOFLAGS} github.com/google/trillian/server/trillian_map_server/
+TRILLIAN_SERVER="$1"
+TEST_STARTED_TRILLIAN_SERVER=false
 
-yes | "${TRILLIAN_PATH}/scripts/resetdb.sh"
+if [ -z "${TRILLIAN_SERVER}" ]; then
+  echo "Launching core Trillian map components"
+  map_prep_test 1
+  TO_KILL+=(${RPC_SERVER_PIDS[@]})
 
-RPC_PORT=$(pick_unused_port)
-
-echo "Starting Map RPC server on localhost:${RPC_PORT}"
-./trillian_map_server --rpc_endpoint="localhost:${RPC_PORT}" http_endpoint='' &
-RPC_SERVER_PID=$!
-wait_for_server_startup ${RPC_PORT}
-TO_KILL+=(${RPC_SERVER_PID})
+  TRILLIAN_SERVER="${RPC_SERVER_1}"
+  TEST_STARTED_TRILLIAN_SERVER=true
+fi
 
 echo "Running test"
 cd "${INTEGRATION_DIR}"
 set +e
-go test ${GOFLAGS} --timeout=5m ./maptest  --map_rpc_server="localhost:${RPC_PORT}" 
+go test \
+  -timeout=${GO_TEST_TIMEOUT:-5m} \
+  ./maptest  --map_rpc_server="${TRILLIAN_SERVER}"
 RESULT=$?
 set -e
 
-echo "Stopping Map RPC server (pid ${RPC_SERVER_PID})"
-kill_pid ${RPC_SERVER_PID}
-TO_KILL=()
+if $TEST_STARTED_TRILLIAN_SERVER; then
+  map_stop_test
+  TO_KILL=()
 
-if [ $RESULT != 0 ]; then
-    sleep 1
-    echo "Server log:"
-    echo "--------------------"
-    cat "${TMPDIR}"/trillian_map_server.INFO
-    exit $RESULT
+  if [ $RESULT != 0 ]; then
+      sleep 1
+      echo "Server log:"
+      echo "--------------------"
+      cat "${TMPDIR}"/trillian_map_server.INFO
+  fi
 fi
+
+exit $RESULT

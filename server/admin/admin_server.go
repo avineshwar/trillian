@@ -16,32 +16,39 @@ package admin
 
 import (
 	"bytes"
+	"context"
+	"fmt"
 
 	"github.com/golang/glog"
 	"github.com/golang/protobuf/ptypes"
-	"github.com/golang/protobuf/ptypes/empty"
 	"github.com/google/trillian"
 	"github.com/google/trillian/crypto/keys/der"
 	"github.com/google/trillian/extension"
 	"github.com/google/trillian/merkle/hashers"
-	_ "github.com/google/trillian/merkle/rfc6962" // Make hashers available
+	"github.com/google/trillian/storage"
 	"github.com/google/trillian/trees"
-	"golang.org/x/net/context"
 	"google.golang.org/genproto/protobuf/field_mask"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-)
 
-var errNotImplemented = status.Errorf(codes.Unimplemented, "not implemented")
+	_ "github.com/google/trillian/merkle/rfc6962" // Make hashers available
+)
 
 // Server is an implementation of trillian.TrillianAdminServer.
 type Server struct {
-	registry extension.Registry
+	registry         extension.Registry
+	allowedTreeTypes []trillian.TreeType
 }
 
 // New returns a trillian.TrillianAdminServer implementation.
-func New(registry extension.Registry) *Server {
-	return &Server{registry}
+// registry is the extension.Registry used by the Server.
+// allowedTreeTypes defines which tree types may be created through this server,
+// with nil meaning unrestricted.
+func New(registry extension.Registry, allowedTreeTypes []trillian.TreeType) *Server {
+	return &Server{
+		registry:         registry,
+		allowedTreeTypes: allowedTreeTypes,
+	}
 }
 
 // IsHealthy returns nil if the server is healthy, error otherwise.
@@ -52,20 +59,11 @@ func (s *Server) IsHealthy() error {
 
 // ListTrees implements trillian.TrillianAdminServer.ListTrees.
 func (s *Server) ListTrees(ctx context.Context, req *trillian.ListTreesRequest) (*trillian.ListTreesResponse, error) {
-	tx, err := s.registry.AdminStorage.Snapshot(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Close()
 	// TODO(codingllama): This needs access control
-	resp, err := tx.ListTrees(ctx)
+	resp, err := storage.ListTrees(ctx, s.registry.AdminStorage, req.GetShowDeleted())
 	if err != nil {
 		return nil, err
 	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-
 	for _, tree := range resp {
 		redact(tree)
 	}
@@ -73,9 +71,8 @@ func (s *Server) ListTrees(ctx context.Context, req *trillian.ListTreesRequest) 
 }
 
 // GetTree implements trillian.TrillianAdminServer.GetTree.
-func (s *Server) GetTree(ctx context.Context, request *trillian.GetTreeRequest) (*trillian.Tree, error) {
-	// TODO(codingllama): This needs access control
-	tree, err := trees.GetTree(ctx, s.registry.AdminStorage, request.GetTreeId(), trees.GetOpts{Readonly: true})
+func (s *Server) GetTree(ctx context.Context, req *trillian.GetTreeRequest) (*trillian.Tree, error) {
+	tree, err := storage.GetTree(ctx, s.registry.AdminStorage, req.GetTreeId())
 	if err != nil {
 		return nil, err
 	}
@@ -83,13 +80,16 @@ func (s *Server) GetTree(ctx context.Context, request *trillian.GetTreeRequest) 
 }
 
 // CreateTree implements trillian.TrillianAdminServer.CreateTree.
-func (s *Server) CreateTree(ctx context.Context, request *trillian.CreateTreeRequest) (*trillian.Tree, error) {
-	tree := request.GetTree()
+func (s *Server) CreateTree(ctx context.Context, req *trillian.CreateTreeRequest) (*trillian.Tree, error) {
+	tree := req.GetTree()
 	if tree == nil {
 		return nil, status.Errorf(codes.InvalidArgument, "a tree is required")
 	}
+	if err := s.validateAllowedTreeType(tree.TreeType); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
 	switch tree.TreeType {
-	case trillian.TreeType_LOG:
+	case trillian.TreeType_LOG, trillian.TreeType_PREORDERED_LOG:
 		if _, err := hashers.NewLogHasher(tree.HashStrategy); err != nil {
 			return nil, status.Errorf(codes.InvalidArgument, "failed to create hasher for tree: %v", err.Error())
 		}
@@ -102,7 +102,7 @@ func (s *Server) CreateTree(ctx context.Context, request *trillian.CreateTreeReq
 	}
 
 	// If a key specification was provided, generate a new key.
-	if request.KeySpec != nil {
+	if req.KeySpec != nil {
 		if tree.PrivateKey != nil {
 			return nil, status.Errorf(codes.InvalidArgument, "the tree.private_key and key_spec fields are mutually exclusive")
 		}
@@ -113,7 +113,7 @@ func (s *Server) CreateTree(ctx context.Context, request *trillian.CreateTreeReq
 			return nil, status.Errorf(codes.FailedPrecondition, "key generation is not enabled")
 		}
 
-		keyProto, err := s.registry.NewKeyProto(ctx, request.KeySpec)
+		keyProto, err := s.registry.NewKeyProto(ctx, req.KeySpec)
 		if err != nil {
 			return nil, status.Errorf(codes.InvalidArgument, "failed to generate private key: %v", err.Error())
 		}
@@ -151,19 +151,30 @@ func (s *Server) CreateTree(ctx context.Context, request *trillian.CreateTreeReq
 		tree.PublicKey = publicKey
 	}
 
-	tx, err := s.registry.AdminStorage.Begin(ctx)
+	// Clear generated fields, storage must set those
+	tree.TreeId = 0
+	tree.CreateTime = nil
+	tree.UpdateTime = nil
+	tree.Deleted = false
+	tree.DeleteTime = nil
+
+	createdTree, err := storage.CreateTree(ctx, s.registry.AdminStorage, tree)
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Close()
-	newTree, err := tx.CreateTree(ctx, tree)
-	if err != nil {
-		return nil, err
+	return redact(createdTree), nil
+}
+
+func (s *Server) validateAllowedTreeType(tt trillian.TreeType) error {
+	if s.allowedTreeTypes == nil {
+		return nil // All types OK
 	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
+	for _, allowedType := range s.allowedTreeTypes {
+		if tt == allowedType {
+			return nil
+		}
 	}
-	return redact(newTree), nil
+	return fmt.Errorf("tree type %s not allowed by this server", tt)
 }
 
 // UpdateTree implements trillian.TrillianAdminServer.UpdateTree.
@@ -178,21 +189,13 @@ func (s *Server) UpdateTree(ctx context.Context, req *trillian.UpdateTreeRequest
 		return nil, err
 	}
 
-	tx, err := s.registry.AdminStorage.Begin(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Close()
-	updatedTree, err := tx.UpdateTree(ctx, tree.TreeId, func(other *trillian.Tree) {
+	updatedTree, err := storage.UpdateTree(ctx, s.registry.AdminStorage, tree.TreeId, func(other *trillian.Tree) {
 		if err := applyUpdateMask(tree, other, mask); err != nil {
 			// Should never happen (famous last words).
 			glog.Errorf("Error applying mask on tree update: %v", err)
 		}
 	})
 	if err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return redact(updatedTree), nil
@@ -206,6 +209,8 @@ func applyUpdateMask(from, to *trillian.Tree, mask *field_mask.FieldMask) error 
 		switch path {
 		case "tree_state":
 			to.TreeState = from.TreeState
+		case "tree_type":
+			to.TreeType = from.TreeType
 		case "display_name":
 			to.DisplayName = from.DisplayName
 		case "description":
@@ -214,6 +219,8 @@ func applyUpdateMask(from, to *trillian.Tree, mask *field_mask.FieldMask) error 
 			to.StorageSettings = from.StorageSettings
 		case "max_root_duration":
 			to.MaxRootDuration = from.MaxRootDuration
+		case "private_key":
+			to.PrivateKey = from.PrivateKey
 		default:
 			return status.Errorf(codes.InvalidArgument, "invalid update_mask path: %q", path)
 		}
@@ -222,8 +229,21 @@ func applyUpdateMask(from, to *trillian.Tree, mask *field_mask.FieldMask) error 
 }
 
 // DeleteTree implements trillian.TrillianAdminServer.DeleteTree.
-func (s *Server) DeleteTree(context.Context, *trillian.DeleteTreeRequest) (*empty.Empty, error) {
-	return nil, errNotImplemented
+func (s *Server) DeleteTree(ctx context.Context, req *trillian.DeleteTreeRequest) (*trillian.Tree, error) {
+	tree, err := storage.SoftDeleteTree(ctx, s.registry.AdminStorage, req.GetTreeId())
+	if err != nil {
+		return nil, err
+	}
+	return redact(tree), nil
+}
+
+// UndeleteTree implements trillian.TrillianAdminServer.UndeleteTree.
+func (s *Server) UndeleteTree(ctx context.Context, req *trillian.UndeleteTreeRequest) (*trillian.Tree, error) {
+	tree, err := storage.UndeleteTree(ctx, s.registry.AdminStorage, req.GetTreeId())
+	if err != nil {
+		return nil, err
+	}
+	return redact(tree), nil
 }
 
 // redact removes sensitive information from t. Returns t for convenience.

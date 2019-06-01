@@ -20,13 +20,18 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc"
+
 	"github.com/google/trillian"
-	_ "github.com/google/trillian/crypto/keys/der/proto" // Register PrivateKey ProtoHandler
+	"github.com/google/trillian/client"
 	"github.com/google/trillian/extension"
 	"github.com/google/trillian/quota"
 	"github.com/google/trillian/storage/memory"
+	"github.com/google/trillian/storage/testdb"
 	"github.com/google/trillian/testonly/integration"
-	"google.golang.org/grpc"
+
+	_ "github.com/google/trillian/crypto/keys/der/proto" // Register PrivateKey ProtoHandler
+	stestonly "github.com/google/trillian/storage/testonly"
 )
 
 var treeIDFlag = flag.Int64("treeid", -1, "The tree id to use")
@@ -52,54 +57,59 @@ func TestLiveLogIntegration(t *testing.T) {
 
 	// Initialize and connect to log server
 	params := TestParameters{
-		treeID:              *treeIDFlag,
-		checkLogEmpty:       *checkLogEmptyFlag,
-		queueLeaves:         *queueLeavesFlag,
-		awaitSequencing:     *awaitSequencingFlag,
-		startLeaf:           *startLeafFlag,
-		leafCount:           *numLeavesFlag,
-		queueBatchSize:      *queueBatchSizeFlag,
-		sequencerBatchSize:  *sequencerBatchSizeFlag,
-		readBatchSize:       *readBatchSizeFlag,
-		sequencingWaitTotal: *waitForSequencingFlag,
-		sequencingPollWait:  *waitBetweenQueueChecksFlag,
-		rpcRequestDeadline:  *rpcRequestDeadlineFlag,
-		customLeafPrefix:    *customLeafPrefixFlag,
+		TreeID:              *treeIDFlag,
+		CheckLogEmpty:       *checkLogEmptyFlag,
+		QueueLeaves:         *queueLeavesFlag,
+		AwaitSequencing:     *awaitSequencingFlag,
+		StartLeaf:           *startLeafFlag,
+		LeafCount:           *numLeavesFlag,
+		QueueBatchSize:      *queueBatchSizeFlag,
+		SequencerBatchSize:  *sequencerBatchSizeFlag,
+		ReadBatchSize:       *readBatchSizeFlag,
+		SequencingWaitTotal: *waitForSequencingFlag,
+		SequencingPollWait:  *waitBetweenQueueChecksFlag,
+		RPCRequestDeadline:  *rpcRequestDeadlineFlag,
+		CustomLeafPrefix:    *customLeafPrefixFlag,
 	}
-	if params.startLeaf < 0 || params.leafCount <= 0 {
-		t.Fatalf("Start leaf index must be >= 0 (%d) and number of leaves must be > 0 (%d)", params.startLeaf, params.leafCount)
+	if params.StartLeaf < 0 || params.LeafCount <= 0 {
+		t.Fatalf("Start leaf index must be >= 0 (%d) and number of leaves must be > 0 (%d)", params.StartLeaf, params.LeafCount)
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	// TODO: Other options apart from insecure connections
-	conn, err := grpc.Dial(*serverFlag, grpc.WithInsecure(), grpc.WithTimeout(time.Second*5))
+	conn, err := grpc.DialContext(ctx, *serverFlag, grpc.WithInsecure())
 	if err != nil {
 		t.Fatalf("Failed to connect to log server: %v", err)
 	}
 	defer conn.Close()
 
-	client := trillian.NewTrillianLogClient(conn)
-	if err := RunLogIntegration(client, params); err != nil {
+	lc := trillian.NewTrillianLogClient(conn)
+	if err := RunLogIntegration(lc, params); err != nil {
 		t.Fatalf("Test failed: %v", err)
 	}
 }
 
 func TestInProcessLogIntegration(t *testing.T) {
+	testdb.SkipIfNoMySQL(t)
 	ctx := context.Background()
 	const numSequencers = 2
-	env, err := integration.NewLogEnv(ctx, numSequencers, "TestInProcessLogIntegration")
+	env, err := integration.NewLogEnv(ctx, numSequencers, "unused")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer env.Close()
 
-	logID, err := env.CreateLog()
+	tree, err := client.CreateAndInitTree(ctx, &trillian.CreateTreeRequest{
+		Tree: stestonly.LogTree,
+	}, env.Admin, nil, env.Log)
 	if err != nil {
 		t.Fatalf("Failed to create log: %v", err)
 	}
 
-	client := trillian.NewTrillianLogClient(env.ClientConn)
-	params := DefaultTestParameters(logID)
-	if err := RunLogIntegration(client, params); err != nil {
+	params := DefaultTestParameters(tree.TreeId)
+	if err := RunLogIntegration(env.Log, params); err != nil {
 		t.Fatalf("Test failed: %v", err)
 	}
 }
@@ -107,29 +117,31 @@ func TestInProcessLogIntegration(t *testing.T) {
 func TestInProcessLogIntegrationDuplicateLeaves(t *testing.T) {
 	ctx := context.Background()
 	const numSequencers = 2
-	ms := memory.NewLogStorage(nil)
+	ts := memory.NewTreeStorage()
+	ms := memory.NewLogStorage(ts, nil)
 
 	reggie := extension.Registry{
-		AdminStorage: memory.NewAdminStorage(ms),
+		AdminStorage: memory.NewAdminStorage(ts),
 		LogStorage:   ms,
 		QuotaManager: quota.Noop(),
 	}
 
-	env, err := integration.NewLogEnvWithRegistry(ctx, numSequencers, "TestInProcessLogIntegrationDuplicateLeaves", reggie)
+	env, err := integration.NewLogEnvWithRegistry(ctx, numSequencers, reggie)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer env.Close()
 
-	logID, err := env.CreateLog()
+	tree, err := client.CreateAndInitTree(ctx, &trillian.CreateTreeRequest{
+		Tree: stestonly.LogTree,
+	}, env.Admin, nil, env.Log)
 	if err != nil {
 		t.Fatalf("Failed to create log: %v", err)
 	}
 
-	client := trillian.NewTrillianLogClient(env.ClientConn)
-	params := DefaultTestParameters(logID)
-	params.uniqueLeaves = 10
-	if err := RunLogIntegration(client, params); err != nil {
+	params := DefaultTestParameters(tree.TreeId)
+	params.UniqueLeaves = 10
+	if err := RunLogIntegration(env.Log, params); err != nil {
 		t.Fatalf("Test failed: %v", err)
 	}
 }

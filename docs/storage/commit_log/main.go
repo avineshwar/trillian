@@ -25,6 +25,7 @@ import (
 	"flag"
 	"fmt"
 	"math/rand"
+	"sync"
 	"time"
 
 	"github.com/golang/glog"
@@ -34,6 +35,7 @@ import (
 )
 
 var (
+	runElections        = flag.Bool("run_elections", false, "Whether to use mastership election; if false, signers run in parallel")
 	signerCount         = flag.Int("signer_count", 3, "Number of parallel signers to run")
 	leafInterval        = flag.Duration("leaf_interval", 500*time.Millisecond, "Period between added leaves")
 	eventInterval       = flag.Duration("event_interval", 1*time.Second, "Interval between events")
@@ -68,17 +70,35 @@ func increment(s string) string {
 	return string(append([]byte(increment(prefix)), 'A'))
 }
 
+type lockedBool struct {
+	mu  sync.RWMutex
+	val bool
+}
+
+func (ab *lockedBool) Get() bool {
+	ab.mu.RLock()
+	defer ab.mu.RUnlock()
+	return ab.val
+}
+func (ab *lockedBool) Set(v bool) {
+	ab.mu.Lock()
+	defer ab.mu.Unlock()
+	ab.val = v
+}
+
 func main() {
 	flag.Parse()
+	defer glog.Flush()
+
 	epochMillis := time.Now().UnixNano() / int64(time.Millisecond)
 
 	// Add leaves forever
-	generateLeaves := true
+	generateLeaves := lockedBool{val: true}
 	go func() {
 		nextLeaf := "A"
 		for {
 			time.Sleep(*leafInterval)
-			if generateLeaves {
+			if generateLeaves.Get() {
 				simkafka.Append("Leaves/<treeID>", nextLeaf)
 				nextLeaf = increment(nextLeaf)
 			}
@@ -86,10 +106,17 @@ func main() {
 	}()
 
 	// Run a few signers forever
-	election := simelection.Election{}
+	var election *simelection.Election
+	if *runElections {
+		election = &simelection.Election{}
+	} else {
+		// Mastership manipulations are irrelevant if no elections.
+		*masterChangePercent = 0
+		*dualMasterPercent = 0
+	}
 	signers := []*signer.Signer{}
 	for ii := 0; ii < *signerCount; ii++ {
-		signers = append(signers, signer.New(signerName(ii), &election, epochMillis))
+		signers = append(signers, signer.New(signerName(ii), election, epochMillis))
 	}
 	for _, s := range signers {
 		go func(s *signer.Signer) {
@@ -121,8 +148,9 @@ func main() {
 			glog.V(1).Infof("EVENT: Make multiple mastership, from %v to %v", election.Masters(), masters)
 			election.SetMasters(masters)
 		case choice < (*masterChangePercent + *dualMasterPercent + *leafTogglePercent):
-			glog.V(1).Infof("EVENT: Toggle leaf generation from %v to %v", generateLeaves, !generateLeaves)
-			generateLeaves = !generateLeaves
+			val := generateLeaves.Get()
+			glog.V(1).Infof("EVENT: Toggle leaf generation from %v to %v", val, !val)
+			generateLeaves.Set(!val)
 		}
 
 		time.Sleep(*eventInterval)

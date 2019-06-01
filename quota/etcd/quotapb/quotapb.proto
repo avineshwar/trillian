@@ -64,17 +64,24 @@ message Config {
 
   // Replenishment strategy used by the config.
   oneof replenishment_strategy {
-
     // Sequencing-based replenishment settings.
     SequencingBasedStrategy sequencing_based = 4;
 
     // Time-based replenishment settings.
     TimeBasedStrategy time_based = 5;
   }
+
+  // Current number of tokens available for the config.
+  // May be higher than max_tokens for DISABLED configs, which are considered to
+  // have "infinite" tokens.
+  // Readonly.
+  int64 current_tokens = 6;
 }
 
 // Sequencing-based replenishment strategy settings.
-// Only global and tree quotas may use sequencing-based replenishment.
+//
+// Only global/write and trees/write quotas may use sequencing-based
+// replenishment.
 message SequencingBasedStrategy {}
 
 // Time-based replenishment strategy settings.

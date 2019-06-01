@@ -19,7 +19,6 @@ import (
 	"context"
 	"crypto"
 	"crypto/sha256"
-	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -33,8 +32,8 @@ import (
 	"github.com/golang/protobuf/proto"
 	"github.com/golang/protobuf/ptypes"
 	"github.com/golang/protobuf/ptypes/any"
+	"github.com/google/certificate-transparency-go/x509"
 	"github.com/google/trillian"
-	tc "github.com/google/trillian/crypto"
 	"github.com/google/trillian/crypto/keys/der"
 	"github.com/google/trillian/crypto/keys/pem"
 	"github.com/google/trillian/crypto/keyspb"
@@ -48,7 +47,11 @@ import (
 	"github.com/google/trillian/storage/cache"
 	"github.com/google/trillian/storage/memory"
 	"github.com/google/trillian/storage/storagepb"
-	"github.com/google/trillian/util"
+	"github.com/google/trillian/trees"
+	"github.com/google/trillian/types"
+	"github.com/google/trillian/util/clock"
+
+	tcrypto "github.com/google/trillian/crypto"
 )
 
 var (
@@ -130,16 +133,16 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEywnWicNEQ8bn3GXcGpA+tiU4VL70
 Ws9xezgQPrg96YGsFrF6KYG68iqyHDlQ+4FWuKfGKXHn3ooVtB/pfawb5Q==
 -----END PUBLIC KEY-----`
 
-func sequence(treeID int64, seq *log.Sequencer, count, batchSize int) {
+func sequence(tree *trillian.Tree, seq *log.Sequencer, count, batchSize int) {
 	glog.Infof("Sequencing batch of size %d", count)
-	sequenced, err := seq.SequenceBatch(context.TODO(), treeID, batchSize, 0, 24*time.Hour)
+	sequenced, err := seq.IntegrateBatch(context.TODO(), tree, batchSize, 0, 24*time.Hour)
 
 	if err != nil {
-		glog.Fatalf("SequenceBatch got: %v, want: no err", err)
+		glog.Fatalf("IntegrateBatch got: %v, want: no err", err)
 	}
 
 	if got, want := sequenced, count; got != want {
-		glog.Fatalf("SequenceBatch got: %d sequenced, want: %d", got, want)
+		glog.Fatalf("IntegrateBatch got: %d sequenced, want: %d", got, want)
 	}
 }
 
@@ -173,16 +176,11 @@ func getPublicKey(keyPEM string) []byte {
 	return keyDER
 }
 
-func createTree(as storage.AdminStorage) (*trillian.Tree, crypto.Signer) {
-	atx, err := as.Begin(context.TODO())
-	if err != nil {
-		glog.Fatalf("Begin admin TX: %v", err)
-	}
-
-	privKey, cSigner := getPrivateKey(logPrivKeyPEM, "towel")
+func createTree(as storage.AdminStorage, ls storage.LogStorage) (*trillian.Tree, *tcrypto.Signer) {
+	ctx := context.TODO()
+	privKey, _ := getPrivateKey(logPrivKeyPEM, "towel")
 	pubKey := getPublicKey(logPubKeyPEM)
-
-	tree := trillian.Tree{
+	tree := &trillian.Tree{
 		TreeType:           trillian.TreeType_LOG,
 		TreeState:          trillian.TreeState_ACTIVE,
 		HashAlgorithm:      sigpb.DigitallySigned_SHA256,
@@ -192,15 +190,38 @@ func createTree(as storage.AdminStorage) (*trillian.Tree, crypto.Signer) {
 		PublicKey:          &keyspb.PublicKey{Der: pubKey},
 		MaxRootDuration:    ptypes.DurationProto(0 * time.Millisecond),
 	}
-	t, err := atx.CreateTree(context.TODO(), &tree)
+	createdTree, err := storage.CreateTree(ctx, as, tree)
 	if err != nil {
 		glog.Fatalf("Create tree: %v", err)
 	}
-	if err := atx.Commit(); err != nil {
-		glog.Fatalf("Commit admin TX: %v", err)
+
+	hasher, err := hashers.NewLogHasher(tree.HashStrategy)
+	if err != nil {
+		glog.Fatalf("NewLogHasher: %v", err)
+	}
+	tSigner, err := trees.Signer(ctx, createdTree)
+	if err != nil {
+		glog.Fatalf("Creating signer: %v", err)
 	}
 
-	return t, cSigner
+	sthZero, err := tSigner.SignLogRoot(&types.LogRootV1{
+		RootHash: hasher.EmptyRoot(),
+	})
+	if err != nil {
+		glog.Fatalf("SignLogRoot: %v", err)
+	}
+
+	err = ls.ReadWriteTransaction(ctx, createdTree, func(ctx context.Context, tx storage.LogTreeTX) error {
+		if err := tx.StoreSignedLogRoot(ctx, *sthZero); err != nil {
+			glog.Fatalf("StoreSignedLogRoot: %v", err)
+		}
+		return nil
+	})
+	if err != nil {
+		glog.Fatalf("ReadWriteTransaction: %v", err)
+	}
+
+	return createdTree, tSigner
 }
 
 // Options are the commandline arguments one can pass to Main
@@ -218,50 +239,53 @@ func Main(args Options) string {
 	leafHashesFlag = args.LeafHashes
 
 	glog.Info("Initializing memory log storage")
-	ls := memory.NewLogStorage(monitoring.InertMetricFactory{})
-	as := memory.NewAdminStorage(ls)
-	tree, cSigner := createTree(as)
+	ts := memory.NewTreeStorage()
+	ls := memory.NewLogStorage(ts, monitoring.InertMetricFactory{})
+	as := memory.NewAdminStorage(ts)
+	tree, tSigner := createTree(as, ls)
 
 	seq := log.NewSequencer(rfc6962.DefaultHasher,
-		util.SystemTimeSource{},
+		clock.System,
 		ls,
-		&tc.Signer{Signer: cSigner, Hash: crypto.SHA256},
+		tSigner,
 		nil,
 		quota.Noop())
 
 	// Create the initial tree head at size 0, which is required. And then sequence the leaves.
-	sequence(tree.TreeId, seq, 0, args.BatchSize)
-	sequenceLeaves(ls, seq, tree.TreeId, args.TreeSize, args.BatchSize, args.LeafFormat)
+	sequence(tree, seq, 0, args.BatchSize)
+	sequenceLeaves(ls, seq, tree, args.TreeSize, args.BatchSize, args.LeafFormat)
 
 	// Read the latest STH back
-	tx, err := ls.BeginForTree(context.TODO(), tree.TreeId)
+	var root types.LogRootV1
+	err := ls.ReadWriteTransaction(context.TODO(), tree, func(ctx context.Context, tx storage.LogTreeTX) error {
+		var err error
+		sth, err := tx.LatestSignedLogRoot(context.TODO())
+		if err != nil {
+			glog.Fatalf("LatestSignedLogRoot: %v", err)
+		}
+		if err := root.UnmarshalBinary(sth.LogRoot); err != nil {
+			return fmt.Errorf("could not parse current log root: %v", err)
+		}
+
+		glog.Infof("STH at size %d has hash %s@%d",
+			root.TreeSize,
+			hex.EncodeToString(root.RootHash),
+			root.Revision)
+		return nil
+	})
 	if err != nil {
-		glog.Fatalf("BeginForTree got: %v, want: no err", err)
-	}
-
-	sth, err := tx.LatestSignedLogRoot(context.TODO())
-	if err != nil {
-		glog.Fatalf("LatestSignedLogRoot: %v", err)
-	}
-
-	glog.Infof("STH at size %d has hash %s@%d",
-		sth.TreeSize,
-		hex.EncodeToString(sth.RootHash),
-		sth.TreeRevision)
-
-	if err := tx.Commit(); err != nil {
-		glog.Fatalf("TX commit: %v", err)
+		glog.Fatalf("ReadWriteTransaction: %v", err)
 	}
 
 	// All leaves are now sequenced into the tree. The current state is what we need.
 	glog.Info("Producing output")
 
 	if args.Traverse {
-		return traverseTreeStorage(ls, tree.TreeId, args.TreeSize, sth.TreeRevision)
+		return traverseTreeStorage(ls, tree, args.TreeSize, int64(root.Revision))
 	}
 
 	if args.DumpLeaves {
-		return dumpLeaves(ls, tree.TreeId, args.TreeSize)
+		return dumpLeaves(ls, tree, args.TreeSize)
 	}
 
 	var formatter func(*storagepb.SubtreeProto) string
@@ -356,32 +380,29 @@ func validateFlagsOrDie(summary, recordIO bool) {
 	}
 }
 
-func sequenceLeaves(ls storage.LogStorage, seq *log.Sequencer, treeID int64, treeSize, batchSize int, leafDataFormat string) {
+func sequenceLeaves(ls storage.LogStorage, seq *log.Sequencer, tree *trillian.Tree, treeSize, batchSize int, leafDataFormat string) {
 	glog.Info("Queuing work")
 	for l := 0; l < treeSize; l++ {
 		glog.V(1).Infof("Queuing leaf %d", l)
 
 		leafData := []byte(fmt.Sprintf(leafDataFormat, l))
-		tx, err := ls.BeginForTree(context.TODO(), treeID)
+		err := ls.ReadWriteTransaction(context.TODO(), tree, func(ctx context.Context, tx storage.LogTreeTX) error {
+			hash := sha256.Sum256(leafData)
+			lh := []byte(hash[:])
+			leaf := trillian.LogLeaf{LeafValue: leafData, LeafIdentityHash: lh, MerkleLeafHash: lh}
+			leaves := []*trillian.LogLeaf{&leaf}
+
+			if _, err := tx.QueueLeaves(context.TODO(), leaves, time.Now()); err != nil {
+				glog.Fatalf("QueueLeaves got: %v, want: no err", err)
+			}
+			return nil
+		})
 		if err != nil {
-			glog.Fatalf("BeginForTree got: %v, want: no err", err)
-		}
-
-		hash := sha256.Sum256(leafData)
-		lh := []byte(hash[:])
-		leaf := trillian.LogLeaf{LeafValue: leafData, LeafIdentityHash: lh, MerkleLeafHash: lh}
-		leaves := []*trillian.LogLeaf{&leaf}
-
-		if _, err := tx.QueueLeaves(context.TODO(), leaves, time.Now()); err != nil {
-			glog.Fatalf("QueueLeaves got: %v, want: no err", err)
-		}
-
-		if err := tx.Commit(); err != nil {
-			glog.Fatalf("Queueleaves TX commit: %v", err)
+			glog.Fatalf("ReadWriteTransaction: %v", err)
 		}
 
 		if l > 0 && l%batchSize == 0 {
-			sequence(treeID, seq, batchSize, batchSize)
+			sequence(tree, seq, batchSize, batchSize)
 		}
 	}
 	glog.Info("Finished queueing")
@@ -390,15 +411,15 @@ func sequenceLeaves(ls storage.LogStorage, seq *log.Sequencer, treeID int64, tre
 	if left == 0 {
 		left = batchSize
 	}
-	sequence(treeID, seq, left, batchSize)
+	sequence(tree, seq, left, batchSize)
 	glog.Info("Finished sequencing")
 }
 
-func traverseTreeStorage(ls storage.LogStorage, treeID int64, ts int, rev int64) string {
+func traverseTreeStorage(ls storage.LogStorage, tree *trillian.Tree, ts int, rev int64) string {
 	out := new(bytes.Buffer)
 	nodesAtLevel := int64(ts)
 
-	tx, err := ls.SnapshotForTree(context.TODO(), treeID)
+	tx, err := ls.SnapshotForTree(context.TODO(), tree)
 	if err != nil {
 		glog.Fatalf("SnapshotForTree: %v", err)
 	}
@@ -452,9 +473,9 @@ func traverseTreeStorage(ls storage.LogStorage, treeID int64, ts int, rev int64)
 	return out.String()
 }
 
-func dumpLeaves(ls storage.LogStorage, treeID int64, ts int) string {
+func dumpLeaves(ls storage.LogStorage, tree *trillian.Tree, ts int) string {
 	out := new(bytes.Buffer)
-	tx, err := ls.SnapshotForTree(context.TODO(), treeID)
+	tx, err := ls.SnapshotForTree(context.TODO(), tree)
 	if err != nil {
 		glog.Fatalf("SnapshotForTree: %v", err)
 	}

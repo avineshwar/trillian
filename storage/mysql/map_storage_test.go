@@ -15,18 +15,40 @@
 package mysql
 
 import (
+	"bytes"
 	"context"
+	"crypto"
 	"database/sql"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/golang/protobuf/proto"
 	"github.com/google/trillian"
-	spb "github.com/google/trillian/crypto/sigpb"
+	"github.com/google/trillian/examples/ct/ctmapper/ctmapperpb"
 	"github.com/google/trillian/storage"
+	"github.com/google/trillian/storage/testdb"
+	"github.com/google/trillian/testonly"
+	"github.com/google/trillian/types"
 	"github.com/kylelemons/godebug/pretty"
+
+	tcrypto "github.com/google/trillian/crypto"
+	storageto "github.com/google/trillian/storage/testonly"
 )
 
+var fixedSigner = tcrypto.NewSigner(0, testonly.NewSignerWithFixedSig(nil, []byte("notempty")), crypto.SHA256)
+
+func MustSignMapRoot(root *types.MapRootV1) *trillian.SignedMapRoot {
+	r, err := fixedSigner.SignMapRoot(root)
+	if err != nil {
+		panic(fmt.Sprintf("SignMapRoot(): %v", err))
+	}
+	return r
+}
+
 func TestMySQLMapStorage_CheckDatabaseAccessible(t *testing.T) {
+	testdb.SkipIfNoMySQL(t)
+
 	cleanTestDB(DB)
 	s := NewMapStorage(DB)
 	if err := s.CheckDatabaseAccessible(context.Background()); err != nil {
@@ -34,186 +56,211 @@ func TestMySQLMapStorage_CheckDatabaseAccessible(t *testing.T) {
 	}
 }
 
-func TestMapBeginSnapshot(t *testing.T) {
-	cleanTestDB(DB)
+func TestMapSnapshot(t *testing.T) {
+	testdb.SkipIfNoMySQL(t)
 
-	frozenMapID := createMapForTests(DB)
-	updateTree(DB, frozenMapID, func(tree *trillian.Tree) {
+	cleanTestDB(DB)
+	ctx := context.Background()
+
+	frozenMap := createInitializedMapForTests(ctx, t, DB)
+	updateTree(DB, frozenMap.TreeId, func(tree *trillian.Tree) {
 		tree.TreeState = trillian.TreeState_FROZEN
 	})
 
-	activeMapID := createMapForTests(DB)
-	logID := createLogForTests(DB)
+	activeMap := createInitializedMapForTests(ctx, t, DB)
+	logID := createTreeOrPanic(DB, storageto.LogTree).TreeId
 
 	tests := []struct {
-		desc  string
-		mapID int64
-		// snapshot defines whether BeginForTree or SnapshotForTree is used for the test.
-		snapshot, wantErr bool
+		desc    string
+		tree    *trillian.Tree
+		wantErr bool
 	}{
 		{
-			desc:    "unknownBegin",
-			mapID:   -1,
+			desc:    "unknownSnapshot",
+			tree:    mapTree(-1),
 			wantErr: true,
 		},
 		{
-			desc:     "unknownSnapshot",
-			mapID:    -1,
-			snapshot: true,
-			wantErr:  true,
+			desc: "activeMapSnapshot",
+			tree: activeMap,
 		},
 		{
-			desc:  "activeMapBegin",
-			mapID: activeMapID,
+			desc: "frozenSnapshot",
+			tree: frozenMap,
 		},
 		{
-			desc:     "activeMapSnapshot",
-			mapID:    activeMapID,
-			snapshot: true,
-		},
-		{
-			desc:    "frozenBegin",
-			mapID:   frozenMapID,
+			desc:    "logSnapshot",
+			tree:    mapTree(logID),
 			wantErr: true,
-		},
-		{
-			desc:     "frozenSnapshot",
-			mapID:    frozenMapID,
-			snapshot: true,
-		},
-		{
-			desc:    "logBegin",
-			mapID:   logID,
-			wantErr: true,
-		},
-		{
-			desc:     "logSnapshot",
-			mapID:    logID,
-			snapshot: true,
-			wantErr:  true,
 		},
 	}
 
-	ctx := context.Background()
 	s := NewMapStorage(DB)
 	for _, test := range tests {
-		func() {
-			var tx rootReaderMapTX
-			var err error
-			if test.snapshot {
-				tx, err = s.SnapshotForTree(ctx, test.mapID)
-			} else {
-				tx, err = s.BeginForTree(ctx, test.mapID)
+		t.Run(test.desc, func(t *testing.T) {
+			tx, err := s.SnapshotForTree(ctx, test.tree)
+			if err != nil {
+				t.Fatalf("SnapshotForTree()=_,%v; want _, nil", err)
 			}
+			defer tx.Close()
 
-			if hasErr := err != nil; hasErr != test.wantErr {
-				t.Errorf("%v: err = %q, wantErr = %v", test.desc, err, test.wantErr)
+			_, err = tx.LatestSignedMapRoot(ctx)
+			if gotErr := (err != nil); gotErr != test.wantErr {
+				t.Errorf("LatestSignedMapRoot()=_,%v; want _, err? %v", err, test.wantErr)
+			}
+			if err != nil {
 				return
+			}
+			if err := tx.Commit(); err != nil {
+				t.Errorf("Commit()=_,%v; want _,nil", err)
+			}
+		})
+	}
+}
+
+func TestMapReadWriteTransaction(t *testing.T) {
+	testdb.SkipIfNoMySQL(t)
+
+	cleanTestDB(DB)
+	ctx := context.Background()
+	activeMap := createInitializedMapForTests(ctx, t, DB)
+
+	tests := []struct {
+		desc        string
+		tree        *trillian.Tree
+		wantRev     int64
+		wantTXRev   int64
+		wantErr     bool
+		wantRootErr string
+	}{
+		{
+			desc:        "unknownBegin",
+			tree:        mapTree(-1),
+			wantRev:     0,
+			wantTXRev:   -1,
+			wantRootErr: "needs initialising",
+		},
+		{
+			desc:      "activeMapBegin",
+			tree:      activeMap,
+			wantRev:   0,
+			wantTXRev: 1,
+		},
+	}
+
+	s := NewMapStorage(DB)
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			err := s.ReadWriteTransaction(ctx, test.tree, func(ctx context.Context, tx storage.MapTreeTX) error {
+				root, err := tx.LatestSignedMapRoot(ctx)
+				if err != nil {
+					if !strings.Contains(err.Error(), test.wantRootErr) {
+						t.Errorf("LatestSignedMapRoot() returned err = %v", err)
+					}
+					return nil
+				}
+				if len(test.wantRootErr) != 0 {
+					t.Fatalf("LatestSignedMapRoot() returned err = %v, want: nil", err)
+				}
+				var mapRoot types.MapRootV1
+				if err := mapRoot.UnmarshalBinary(root.MapRoot); err != nil {
+					t.Fatalf("UmarshalBinary(): %v", err)
+				}
+				gotRev, _ := tx.WriteRevision(ctx)
+				if gotRev != test.wantTXRev {
+					t.Errorf("WriteRevision() = %v, want = %v", gotRev, test.wantTXRev)
+				}
+				if got, want := int64(mapRoot.Revision), test.wantRev; got != want {
+					t.Errorf("TreeRevision() = %v, want = %v", got, want)
+				}
+				return nil
+			})
+			if hasErr := err != nil; hasErr != test.wantErr {
+				t.Fatalf("err = %q, wantErr = %v", err, test.wantErr)
 			} else if hasErr {
 				return
 			}
-			defer tx.Close()
-
-			root, err := tx.LatestSignedMapRoot(ctx)
-			if err != nil {
-				t.Errorf("%v: LatestSignedMapRoot() returned err = %v", test.desc, err)
-			}
-			if err := tx.Commit(); err != nil {
-				t.Errorf("%v: Commit() returned err = %v", test.desc, err)
-			}
-
-			if !test.snapshot {
-				tx := tx.(storage.TreeTX)
-				if got, want := tx.WriteRevision(), root.MapRevision+1; got != want {
-					t.Errorf("%v: WriteRevision() = %v, want = %v", test.desc, got, want)
-				}
-			}
-		}()
+		})
 	}
 }
 
-type rootReaderMapTX interface {
-	storage.ReadOnlyTreeTX
-	storage.MapRootReader
-}
-
 func TestMapRootUpdate(t *testing.T) {
+	testdb.SkipIfNoMySQL(t)
+
 	cleanTestDB(DB)
-	mapID := createMapForTests(DB)
+	ctx := context.Background()
+	tree := createInitializedMapForTests(ctx, t, DB)
 	s := NewMapStorage(DB)
 
-	ctx := context.Background()
+	populatedMetadata := testonly.MustMarshalAnyNoT(&ctmapperpb.MapperMetadata{HighestFullyCompletedSeq: 1})
 
 	for _, tc := range []struct {
-		desc string
-		root trillian.SignedMapRoot
+		desc         string
+		root         *trillian.SignedMapRoot
+		wantMetadata []byte
 	}{
 		{
 			desc: "Initial root",
-			root: trillian.SignedMapRoot{
-				MapId:          mapID,
+			root: MustSignMapRoot(&types.MapRootV1{
 				TimestampNanos: 98765,
-				MapRevision:    5,
+				Revision:       5,
 				RootHash:       []byte(dummyHash),
-				Signature:      &spb.DigitallySigned{Signature: []byte("notempty")},
-			}},
+			}),
+		},
 		{
 			desc: "Root update",
-			root: trillian.SignedMapRoot{
-				MapId:          mapID,
+			root: MustSignMapRoot(&types.MapRootV1{
 				TimestampNanos: 98766,
-				MapRevision:    6,
+				Revision:       6,
 				RootHash:       []byte(dummyHash),
-				Signature:      &spb.DigitallySigned{Signature: []byte("notempty")},
-			}},
+			}),
+		},
 		{
-			desc: "Root with default MapperMetadata",
-			root: trillian.SignedMapRoot{
-				MapId:          mapID,
+			desc: "Root with default (empty) MapperMetadata",
+			root: MustSignMapRoot(&types.MapRootV1{
 				TimestampNanos: 98768,
-				MapRevision:    7,
+				Revision:       7,
 				RootHash:       []byte(dummyHash),
-				Signature:      &spb.DigitallySigned{Signature: []byte("notempty")},
-				Metadata: &trillian.MapperMetadata{
-					HighestFullyCompletedSeq: 0,
-				},
-			}},
+			}),
+		},
 		{
-			desc: "Root with non-default MapperMetadata",
-			root: trillian.SignedMapRoot{
-				MapId:          mapID,
+			desc: "Root with non-default (populated) MapperMetadata",
+			root: MustSignMapRoot(&types.MapRootV1{
 				TimestampNanos: 98769,
-				MapRevision:    8,
+				Revision:       8,
 				RootHash:       []byte(dummyHash),
-				Signature:      &spb.DigitallySigned{Signature: []byte("notempty")},
-				Metadata: &trillian.MapperMetadata{
-					HighestFullyCompletedSeq: 1,
-				},
-			}},
+				Metadata:       populatedMetadata,
+			}),
+			wantMetadata: populatedMetadata,
+		},
 	} {
-		{
-			tx := beginMapTx(ctx, s, mapID, t)
-			defer tx.Close()
-			if err := tx.StoreSignedMapRoot(ctx, tc.root); err != nil {
-				t.Fatalf("%v: Failed to store signed map root: %v", tc.desc, err)
-			}
-			if err := tx.Commit(); err != nil {
-				t.Fatalf("%v: Failed to commit new map roots: %v", tc.desc, err)
-			}
-		}
-		{
-			tx := beginMapTx(ctx, s, mapID, t)
-			defer tx.Close()
-			root, err := tx.LatestSignedMapRoot(ctx)
-			if err != nil {
-				t.Fatalf("%v: Failed to read back new map root: %v", tc.desc, err)
-			}
-			if got, want := &root, &tc.root; !proto.Equal(got, want) {
-				t.Fatalf("%v: LatestSignedMapRoot(): %v, diff(-got, +want) \n%v", tc.desc,
-					pretty.Sprint(got), pretty.Compare(got, want))
-			}
-			commit(tx, t)
-		}
+		func() {
+			runMapTX(ctx, s, tree, t, func(ctx context.Context, tx storage.MapTreeTX) error {
+				if err := tx.StoreSignedMapRoot(ctx, *tc.root); err != nil {
+					t.Fatalf("%v: Failed to store signed map root: %v", tc.desc, err)
+				}
+				return nil
+			})
+		}()
+
+		func() {
+			runMapTX(ctx, s, tree, t, func(ctx context.Context, tx storage.MapTreeTX) error {
+				smr, err := tx.LatestSignedMapRoot(ctx)
+				if err != nil {
+					t.Fatalf("%v: Failed to read back new map root: %v", tc.desc, err)
+				}
+
+				var root types.MapRootV1
+				if err := root.UnmarshalBinary(smr.MapRoot); err != nil {
+					t.Fatalf("%v: UnmarshalBinary(): %v", tc.desc, err)
+				}
+
+				if got, want := root.Metadata, tc.wantMetadata; !bytes.Equal(got, want) {
+					t.Errorf("%v: LatestSignedMapRoot() diff(-got, +want) \n%v", tc.desc, pretty.Compare(got, want))
+				}
+				return nil
+			})
+		}()
 	}
 }
 
@@ -226,98 +273,103 @@ var mapLeaf = trillian.MapLeaf{
 }
 
 func TestMapSetGetRoundTrip(t *testing.T) {
+	testdb.SkipIfNoMySQL(t)
+
 	cleanTestDB(DB)
-	mapID := createMapForTests(DB)
+	ctx := context.Background()
+	tree := createInitializedMapForTests(ctx, t, DB)
 	s := NewMapStorage(DB)
 
 	readRev := int64(1)
-	ctx := context.Background()
 	{
-		tx := beginMapTx(ctx, s, mapID, t)
-		defer tx.Close()
-		if err := tx.Set(ctx, keyHash, mapLeaf); err != nil {
-			t.Fatalf("Failed to set %v to %v: %v", keyHash, mapLeaf, err)
-		}
-		if err := tx.Commit(); err != nil {
-			t.Fatalf("Failed to commit: %v", err)
-		}
+		runMapTX(ctx, s, tree, t, func(ctx context.Context, tx storage.MapTreeTX) error {
+			if err := tx.Set(ctx, keyHash, mapLeaf); err != nil {
+				t.Fatalf("Failed to set %v to %v: %v", keyHash, mapLeaf, err)
+			}
+			return nil
+		})
 	}
 
 	{
-		tx := beginMapTx(ctx, s, mapID, t)
-		defer tx.Close()
-		readValues, err := tx.Get(ctx, readRev, [][]byte{keyHash})
-		if err != nil {
-			t.Fatalf("Failed to get %v:  %v", keyHash, err)
-		}
-		if got, want := len(readValues), 1; got != want {
-			t.Fatalf("Got %d values, expected %d", got, want)
-		}
-		if got, want := &readValues[0], &mapLeaf; !proto.Equal(got, want) {
-			t.Fatalf("Read back %v, but expected %v", got, want)
-		}
-		commit(tx, t)
+		runMapTX(ctx, s, tree, t, func(ctx context.Context, tx storage.MapTreeTX) error {
+			readValues, err := tx.Get(ctx, readRev, [][]byte{keyHash})
+			if err != nil {
+				t.Fatalf("Failed to get %v:  %v", keyHash, err)
+			}
+			if got, want := len(readValues), 1; got != want {
+				t.Fatalf("Got %d values, expected %d", got, want)
+			}
+			if got, want := readValues[0], &mapLeaf; !proto.Equal(got, want) {
+				t.Fatalf("Read back %v, but expected %v", got, want)
+			}
+			return nil
+		})
 	}
 }
 
 func TestMapSetSameKeyInSameRevisionFails(t *testing.T) {
+	testdb.SkipIfNoMySQL(t)
+
 	cleanTestDB(DB)
-	mapID := createMapForTests(DB)
+	ctx := context.Background()
+	tree := createInitializedMapForTests(ctx, t, DB)
 	s := NewMapStorage(DB)
 
-	ctx := context.Background()
-
 	{
-		tx := beginMapTx(ctx, s, mapID, t)
-		defer tx.Close()
-		if err := tx.Set(ctx, keyHash, mapLeaf); err != nil {
-			t.Fatalf("Failed to set %v to %v: %v", keyHash, mapLeaf, err)
-		}
-		if err := tx.Commit(); err != nil {
-			t.Fatalf("Failed to commit: %v", err)
-		}
+		runMapTX(ctx, s, tree, t, func(ctx context.Context, tx storage.MapTreeTX) error {
+			if err := tx.Set(ctx, keyHash, mapLeaf); err != nil {
+				t.Fatalf("Failed to set %v to %v: %v", keyHash, mapLeaf, err)
+			}
+			return nil
+		})
 	}
 
 	{
-		tx := beginMapTx(ctx, s, mapID, t)
-		defer tx.Close()
-		if err := tx.Set(ctx, keyHash, mapLeaf); err == nil {
-			t.Fatalf("Unexpectedly succeeded in setting %v to %v", keyHash, mapLeaf)
-		}
-		commit(tx, t)
+		runMapTX(ctx, s, tree, t, func(ctx context.Context, tx storage.MapTreeTX) error {
+			if err := tx.Set(ctx, keyHash, mapLeaf); err == nil {
+				t.Fatalf("Unexpectedly succeeded in setting %v to %v", keyHash, mapLeaf)
+			}
+			return nil
+		})
 	}
 }
 
 func TestMapGet0Results(t *testing.T) {
+	testdb.SkipIfNoMySQL(t)
+
 	cleanTestDB(DB)
-	mapID := createMapForTests(DB)
+	ctx := context.Background()
+	tree := createInitializedMapForTests(ctx, t, DB)
 	s := NewMapStorage(DB)
 
-	ctx := context.Background()
 	for _, tc := range []struct {
 		index [][]byte
 	}{
 		{index: nil}, //empty list.
 		{index: [][]byte{[]byte("This doesn't exist.")}},
 	} {
-		tx := beginMapTx(ctx, s, mapID, t)
-		defer tx.Close()
-		defer commit(tx, t)
-		readValues, err := tx.Get(ctx, 1, tc.index)
-		if err != nil {
-			t.Errorf("tx.Get(%s): %v", tc.index, err)
-			continue
-		}
-		if got, want := len(readValues), 0; got != want {
-			t.Errorf("len(tx.Get(%s)): %d, want %d", tc.index, got, want)
-		}
+		t.Run(fmt.Sprintf("tx.Get(%s)", tc.index), func(t *testing.T) {
+			runMapTX(ctx, s, tree, t, func(ctx context.Context, tx storage.MapTreeTX) error {
+				readValues, err := tx.Get(ctx, 1, tc.index)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got, want := len(readValues), 0; got != want {
+					t.Fatalf("len = %d, want %d", got, want)
+				}
+				return nil
+			})
+		})
 	}
 }
 
 func TestMapSetGetMultipleRevisions(t *testing.T) {
+	testdb.SkipIfNoMySQL(t)
+
 	// Write two roots for a map and make sure the one with the newest timestamp supersedes
 	cleanTestDB(DB)
-	mapID := createMapForTests(DB)
+	ctx := context.Background()
+	tree := createInitializedMapForTests(ctx, t, DB)
 	s := NewMapStorage(DB)
 
 	tests := []struct {
@@ -330,21 +382,17 @@ func TestMapSetGetMultipleRevisions(t *testing.T) {
 		{3, trillian.MapLeaf{Index: keyHash, LeafHash: []byte{3}, LeafValue: []byte{3}, ExtraData: []byte{3}}},
 	}
 
-	ctx := context.Background()
 	for _, tc := range tests {
 		func() {
 			// Write the current test case.
-			tx := beginMapTx(ctx, s, mapID, t)
-			defer tx.Close()
-
-			mapTX := tx.(*mapTreeTX)
-			mapTX.treeTX.writeRevision = tc.rev
-			if err := tx.Set(ctx, keyHash, tc.leaf); err != nil {
-				t.Fatalf("Failed to set %v to %v: %v", keyHash, tc.leaf, err)
-			}
-			if err := tx.Commit(); err != nil {
-				t.Fatalf("Failed to commit: %v", err)
-			}
+			runMapTX(ctx, s, tree, t, func(ctx context.Context, tx storage.MapTreeTX) error {
+				mapTX := tx.(*mapTreeTX)
+				mapTX.treeTX.writeRevision = tc.rev
+				if err := tx.Set(ctx, keyHash, tc.leaf); err != nil {
+					t.Fatalf("Failed to set %v to %v: %v", keyHash, tc.leaf, err)
+				}
+				return nil
+			})
 
 			// Read at a point in time in the future. Expect to get the latest value.
 			// Read at each point in the past. Expect to get that exact point in history.
@@ -355,20 +403,19 @@ func TestMapSetGetMultipleRevisions(t *testing.T) {
 						expectRev = tc.rev // For future revisions, expect the current value.
 					}
 
-					tx2 := beginMapTx(ctx, s, mapID, t)
-					defer tx2.Close()
-
-					readValues, err := tx2.Get(ctx, i, [][]byte{keyHash})
-					if err != nil {
-						t.Fatalf("At i %d failed to get %v:  %v", i, keyHash, err)
-					}
-					if got, want := len(readValues), 1; got != want {
-						t.Fatalf("At i %d got %d values, expected %d", i, got, want)
-					}
-					if got, want := &readValues[0], &tests[expectRev].leaf; !proto.Equal(got, want) {
-						t.Fatalf("At i %d read back %v, but expected %v", i, got, want)
-					}
-					commit(tx2, t)
+					runMapTX(ctx, s, tree, t, func(ctx context.Context, tx2 storage.MapTreeTX) error {
+						readValues, err := tx2.Get(ctx, i, [][]byte{keyHash})
+						if err != nil {
+							t.Fatalf("At i %d failed to get %v:  %v", i, keyHash, err)
+						}
+						if got, want := len(readValues), 1; got != want {
+							t.Fatalf("At i %d got %d values, expected %d", i, got, want)
+						}
+						if got, want := readValues[0], &tests[expectRev].leaf; !proto.Equal(got, want) {
+							t.Fatalf("At i %d read back %v, but expected %v", i, got, want)
+						}
+						return nil
+					})
 				}()
 			}
 		}()
@@ -376,145 +423,146 @@ func TestMapSetGetMultipleRevisions(t *testing.T) {
 }
 
 func TestGetSignedMapRootNotExist(t *testing.T) {
+	testdb.SkipIfNoMySQL(t)
+
 	cleanTestDB(DB)
-	mapID := createMapForTests(DB)
+	tree := createTreeOrPanic(DB, storageto.MapTree) // Uninitialized: no revision 0 MapRoot exists.
 	s := NewMapStorage(DB)
 
 	ctx := context.Background()
-	tx := beginMapTx(ctx, s, mapID, t)
-	defer tx.Close()
-
-	root, err := tx.GetSignedMapRoot(ctx, 10)
-	if got, want := err, sql.ErrNoRows; got != want {
-		t.Fatalf("GetSignedMapRoot: %v, want %v", got, want)
+	err := s.ReadWriteTransaction(ctx, tree, func(ctx context.Context, tx storage.MapTreeTX) error {
+		_, err := tx.GetSignedMapRoot(ctx, 0)
+		if got, want := err, storage.ErrTreeNeedsInit; got != want {
+			t.Fatalf("GetSignedMapRoot: %v, want %v", got, want)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("ReadWriteTransaction: %v", err)
 	}
-	if root.MapId != 0 || len(root.RootHash) != 0 || root.Signature != nil {
-		t.Fatalf("Read a root with contents when it should be empty: %v", root)
-	}
-	commit(tx, t)
 }
 
 func TestLatestSignedMapRootNoneWritten(t *testing.T) {
+	// TODO(phad): I'm considering removing this test, because for an Map that has been
+	// initialized there should always be the revision 0 SMR written to the DB, and
+	// without initialization the error path is identical to that tested in the func
+	// TestGetSignedMapRootNotExist above.
+	t.Skip("TODO: remove this as it can no longer occur.")
+
 	cleanTestDB(DB)
-	mapID := createMapForTests(DB)
+	ctx := context.Background()
+	tree := createInitializedMapForTests(ctx, t, DB)
 	s := NewMapStorage(DB)
 
-	ctx := context.Background()
-	tx := beginMapTx(ctx, s, mapID, t)
-	defer tx.Close()
-
-	root, err := tx.LatestSignedMapRoot(ctx)
-	if err != nil {
-		t.Fatalf("Failed to read an empty map root: %v", err)
-	}
-	if root.MapId != 0 || len(root.RootHash) != 0 || root.Signature != nil {
-		t.Fatalf("Read a root with contents when it should be empty: %v", root)
-	}
-	commit(tx, t)
+	runMapTX(ctx, s, tree, t, func(ctx context.Context, tx storage.MapTreeTX) error {
+		root, err := tx.LatestSignedMapRoot(ctx)
+		if err != nil {
+			t.Fatalf("Failed to read an empty map root: %v", err)
+		}
+		if len(root.MapRoot) != 0 || root.Signature != nil {
+			t.Fatalf("Read a root with contents when it should be empty: %v", root)
+		}
+		return nil
+	})
 }
 
 func TestGetSignedMapRoot(t *testing.T) {
+	testdb.SkipIfNoMySQL(t)
+
 	cleanTestDB(DB)
-	mapID := createMapForTests(DB)
+	ctx := context.Background()
+	tree := createInitializedMapForTests(ctx, t, DB)
 	s := NewMapStorage(DB)
 
-	ctx := context.Background()
-	tx := beginMapTx(ctx, s, mapID, t)
-	defer tx.Close()
-
 	revision := int64(5)
-	root := trillian.SignedMapRoot{
-		MapId:          mapID,
+	root := MustSignMapRoot(&types.MapRootV1{
 		TimestampNanos: 98765,
-		MapRevision:    revision,
+		Revision:       uint64(revision),
 		RootHash:       []byte(dummyHash),
-		Signature:      &spb.DigitallySigned{Signature: []byte("notempty")},
-	}
-	if err := tx.StoreSignedMapRoot(ctx, root); err != nil {
-		t.Fatalf("Failed to store signed root: %v", err)
-	}
-	if err := tx.Commit(); err != nil {
-		t.Fatalf("Failed to commit new map root: %v", err)
-	}
+	})
+	runMapTX(ctx, s, tree, t, func(ctx context.Context, tx storage.MapTreeTX) error {
+		if err := tx.StoreSignedMapRoot(ctx, *root); err != nil {
+			t.Fatalf("Failed to store signed root: %v", err)
+		}
+		return nil
+	})
 
 	{
-		tx2 := beginMapTx(ctx, s, mapID, t)
-		defer tx2.Close()
-		root2, err := tx2.GetSignedMapRoot(ctx, revision)
-		if err != nil {
-			t.Fatalf("Failed to get back new map root: %v", err)
-		}
-		if !proto.Equal(&root, &root2) {
-			t.Fatalf("Getting root round trip failed: <%#v> and: <%#v>", root, root2)
-		}
-		commit(tx2, t)
+		runMapTX(ctx, s, tree, t, func(ctx context.Context, tx2 storage.MapTreeTX) error {
+			root2, err := tx2.GetSignedMapRoot(ctx, revision)
+			if err != nil {
+				t.Fatalf("Failed to get back new map root: %v", err)
+			}
+			if !proto.Equal(root, &root2) {
+				t.Fatalf("Getting root round trip failed: <%#v> and: <%#v>", root, root2)
+			}
+			return nil
+		})
 	}
 }
 
 func TestLatestSignedMapRoot(t *testing.T) {
+	testdb.SkipIfNoMySQL(t)
+
 	cleanTestDB(DB)
-	mapID := createMapForTests(DB)
+	ctx := context.Background()
+	tree := createInitializedMapForTests(ctx, t, DB)
 	s := NewMapStorage(DB)
 
-	ctx := context.Background()
-	tx := beginMapTx(ctx, s, mapID, t)
-	defer tx.Close()
-
-	root := trillian.SignedMapRoot{
-		MapId:          mapID,
+	root := MustSignMapRoot(&types.MapRootV1{
 		TimestampNanos: 98765,
-		MapRevision:    5,
+		Revision:       5,
 		RootHash:       []byte(dummyHash),
-		Signature:      &spb.DigitallySigned{Signature: []byte("notempty")},
-	}
-	if err := tx.StoreSignedMapRoot(ctx, root); err != nil {
-		t.Fatalf("Failed to store signed root: %v", err)
-	}
-	if err := tx.Commit(); err != nil {
-		t.Fatalf("Failed to commit new map root: %v", err)
-	}
+	})
+	runMapTX(ctx, s, tree, t, func(ctx context.Context, tx storage.MapTreeTX) error {
+		if err := tx.StoreSignedMapRoot(ctx, *root); err != nil {
+			t.Fatalf("Failed to store signed root: %v", err)
+		}
+		return nil
+	})
 
 	{
-		tx2 := beginMapTx(ctx, s, mapID, t)
-		defer tx2.Close()
-		root2, err := tx2.LatestSignedMapRoot(ctx)
-		if err != nil {
-			t.Fatalf("Failed to read back new map root: %v", err)
-		}
-		if !proto.Equal(&root, &root2) {
-			t.Fatalf("Root round trip failed: <%#v> and: <%#v>", root, root2)
-		}
-		commit(tx2, t)
+		runMapTX(ctx, s, tree, t, func(ctx context.Context, tx2 storage.MapTreeTX) error {
+			root2, err := tx2.LatestSignedMapRoot(ctx)
+			if err != nil {
+				t.Fatalf("Failed to read back new map root: %v", err)
+			}
+			if !proto.Equal(root, &root2) {
+				t.Fatalf("Root round trip failed: <%#v> and: <%#v>", root, root2)
+			}
+			return nil
+		})
 	}
 }
 
 func TestDuplicateSignedMapRoot(t *testing.T) {
+	testdb.SkipIfNoMySQL(t)
+
 	cleanTestDB(DB)
-	mapID := createMapForTests(DB)
+	ctx := context.Background()
+	tree := createInitializedMapForTests(ctx, t, DB)
 	s := NewMapStorage(DB)
 
-	ctx := context.Background()
-	tx := beginMapTx(ctx, s, mapID, t)
-	defer tx.Close()
-
-	root := trillian.SignedMapRoot{
-		MapId:          mapID,
-		TimestampNanos: 98765,
-		MapRevision:    5,
-		RootHash:       []byte(dummyHash),
-		Signature:      &spb.DigitallySigned{Signature: []byte("notempty")},
-	}
-	if err := tx.StoreSignedMapRoot(ctx, root); err != nil {
-		t.Fatalf("Failed to store signed map root: %v", err)
-	}
-	// Shouldn't be able to do it again
-	if err := tx.StoreSignedMapRoot(ctx, root); err == nil {
-		t.Fatal("Allowed duplicate signed map root")
-	}
-	commit(tx, t)
+	runMapTX(ctx, s, tree, t, func(ctx context.Context, tx storage.MapTreeTX) error {
+		root := MustSignMapRoot(&types.MapRootV1{
+			TimestampNanos: 98765,
+			Revision:       5,
+			RootHash:       []byte(dummyHash),
+		})
+		if err := tx.StoreSignedMapRoot(ctx, *root); err != nil {
+			t.Fatalf("Failed to store signed map root: %v", err)
+		}
+		// Shouldn't be able to do it again
+		if err := tx.StoreSignedMapRoot(ctx, *root); err == nil {
+			t.Fatal("Allowed duplicate signed map root")
+		}
+		return nil
+	})
 }
 
 func TestReadOnlyMapTX_Rollback(t *testing.T) {
+	testdb.SkipIfNoMySQL(t)
+
 	cleanTestDB(DB)
 	s := NewMapStorage(DB)
 	tx, err := s.Snapshot(context.Background())
@@ -528,10 +576,40 @@ func TestReadOnlyMapTX_Rollback(t *testing.T) {
 	}
 }
 
-func beginMapTx(ctx context.Context, s storage.MapStorage, mapID int64, t *testing.T) storage.MapTreeTX {
-	tx, err := s.BeginForTree(ctx, mapID)
-	if err != nil {
+func runMapTX(ctx context.Context, s storage.MapStorage, tree *trillian.Tree, t *testing.T, f storage.MapTXFunc) {
+	if err := s.ReadWriteTransaction(ctx, tree, f); err != nil {
 		t.Fatalf("Failed to begin map tx: %v", err)
 	}
-	return tx
+}
+
+func createInitializedMapForTests(ctx context.Context, t *testing.T, db *sql.DB) *trillian.Tree {
+	t.Helper()
+	tree := createTreeOrPanic(db, storageto.MapTree)
+
+	s := NewMapStorage(db)
+	signer := tcrypto.NewSigner(tree.TreeId, testonly.NewSignerWithFixedSig(nil, []byte("sig")), crypto.SHA256)
+	err := s.ReadWriteTransaction(ctx, tree, func(ctx context.Context, tx storage.MapTreeTX) error {
+		initialRoot, _ := signer.SignMapRoot(&types.MapRootV1{
+			RootHash: []byte("rootHash"),
+			Revision: 0,
+		})
+
+		if err := tx.StoreSignedMapRoot(ctx, *initialRoot); err != nil {
+			t.Fatalf("Failed to StoreSignedMapRoot: %v", err)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("ReadWriteTransaction() = %v", err)
+	}
+
+	return tree
+}
+
+func mapTree(mapID int64) *trillian.Tree {
+	return &trillian.Tree{
+		TreeId:       mapID,
+		TreeType:     trillian.TreeType_MAP,
+		HashStrategy: trillian.HashStrategy_TEST_MAP_HASHER,
+	}
 }

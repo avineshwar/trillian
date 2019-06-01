@@ -17,20 +17,102 @@
 package trees
 
 import (
+	"context"
 	"crypto"
 	"fmt"
 
 	"github.com/golang/protobuf/ptypes"
 	"github.com/google/trillian"
-	tcrypto "github.com/google/trillian/crypto"
 	"github.com/google/trillian/crypto/keys"
 	"github.com/google/trillian/crypto/sigpb"
-	"github.com/google/trillian/errors"
+	"github.com/google/trillian/monitoring"
 	"github.com/google/trillian/storage"
-	"golang.org/x/net/context"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	tcrypto "github.com/google/trillian/crypto"
 )
 
+const traceSpanRoot = "/trillian/trees"
+
 type treeKey struct{}
+
+type accessRule struct {
+	// Tree states are accepted if there is a 'true' value for them in this map.
+	okStates map[trillian.TreeState]bool
+	// Allows the error code to be specified for specific rejected states.
+	rejectCodes map[trillian.TreeState]codes.Code
+	// Tree types are accepted if there is a 'true' value for them in this map.
+	okTypes map[trillian.TreeType]bool
+}
+
+// These rules define the permissible combinations of tree state and type
+// for each operation type.
+var rules = map[OpType]accessRule{
+	Unknown: {},
+	Admin: {
+		okStates: map[trillian.TreeState]bool{
+			trillian.TreeState_UNKNOWN_TREE_STATE: true,
+			trillian.TreeState_ACTIVE:             true,
+			trillian.TreeState_DRAINING:           true,
+			trillian.TreeState_FROZEN:             true,
+		},
+		okTypes: map[trillian.TreeType]bool{
+			trillian.TreeType_LOG:            true,
+			trillian.TreeType_MAP:            true,
+			trillian.TreeType_PREORDERED_LOG: true,
+		},
+	},
+	Query: {
+		okStates: map[trillian.TreeState]bool{
+			// Have to allow queries on unknown state so storage can get a chance
+			// to return ErrTreeNeedsInit.
+			trillian.TreeState_UNKNOWN_TREE_STATE: true,
+			trillian.TreeState_ACTIVE:             true,
+			trillian.TreeState_DRAINING:           true,
+			trillian.TreeState_FROZEN:             true,
+		},
+		okTypes: map[trillian.TreeType]bool{
+			trillian.TreeType_LOG:            true,
+			trillian.TreeType_MAP:            true,
+			trillian.TreeType_PREORDERED_LOG: true,
+		},
+	},
+	QueueLog: {
+		okStates: map[trillian.TreeState]bool{
+			trillian.TreeState_ACTIVE: true,
+		},
+		rejectCodes: map[trillian.TreeState]codes.Code{
+			trillian.TreeState_DRAINING: codes.PermissionDenied,
+			trillian.TreeState_FROZEN:   codes.PermissionDenied,
+		},
+		okTypes: map[trillian.TreeType]bool{
+			trillian.TreeType_LOG:            true,
+			trillian.TreeType_PREORDERED_LOG: true,
+		},
+	},
+	SequenceLog: {
+		okStates: map[trillian.TreeState]bool{
+			trillian.TreeState_ACTIVE:   true,
+			trillian.TreeState_DRAINING: true,
+		},
+		okTypes: map[trillian.TreeType]bool{
+			trillian.TreeType_LOG:            true,
+			trillian.TreeType_PREORDERED_LOG: true,
+		},
+		rejectCodes: map[trillian.TreeState]codes.Code{
+			trillian.TreeState_FROZEN: codes.PermissionDenied,
+		},
+	},
+	UpdateMap: {
+		okStates: map[trillian.TreeState]bool{
+			trillian.TreeState_ACTIVE: true,
+		},
+		okTypes: map[trillian.TreeType]bool{
+			trillian.TreeType_MAP: true,
+		},
+	},
+}
 
 // NewContext returns a ctx with the given tree.
 func NewContext(ctx context.Context, tree *trillian.Tree) context.Context {
@@ -44,55 +126,54 @@ func FromContext(ctx context.Context) (*trillian.Tree, bool) {
 	return tree, ok && tree != nil
 }
 
-// GetOpts contains validation options for GetTree.
-type GetOpts struct {
-	// TreeType is the expected type of the tree. Use trillian.TreeType_UNKNOWN_TREE_TYPE to
-	// allow any type.
-	TreeType trillian.TreeType
-	// Readonly is whether the tree will be used for read-only purposes.
-	Readonly bool
+func validate(o GetOpts, tree *trillian.Tree) error {
+	// Do the special case checks first
+	if len(o.TreeTypes) > 0 && !o.TreeTypes[tree.TreeType] {
+		return status.Errorf(codes.InvalidArgument, "operation not allowed for %s-type trees (wanted one of %v)", tree.TreeType, o.TreeTypes)
+	}
+
+	// Reject any operation types we don't know about.
+	rule, ok := rules[o.Operation]
+	if !ok {
+		return status.Errorf(codes.Internal, "invalid operation type in GetOpts: %v", o)
+	}
+
+	// Apply the rule, ensure it allows the tree type and state that we have.
+	if !rule.okTypes[tree.TreeType] || !rule.okStates[tree.TreeState] {
+		// If we have a status code to use it takes precedence, otherwise it's
+		// a generic InvalidArgument code.
+		code, ok := rule.rejectCodes[tree.TreeState]
+		if !ok {
+			code = codes.InvalidArgument
+		}
+		return status.Errorf(code, "operation: %v not allowed for tree type: %v state: %v", o.Operation, tree.TreeType, tree.TreeState)
+	}
+
+	return nil
 }
 
 // GetTree returns the specified tree, either from the ctx (if present) or read from storage.
 // The tree will be validated according to GetOpts before returned. Tree state is also considered
 // (for example, deleted tree will return NotFound errors).
 func GetTree(ctx context.Context, s storage.AdminStorage, treeID int64, opts GetOpts) (*trillian.Tree, error) {
-	// TODO(codingllama): Record stats of ctx hits/misses, so we can assess whether RPCs work
-	// as intended.
+	ctx, spanEnd := spanFor(ctx, "GetTree")
+	defer spanEnd()
 	tree, ok := FromContext(ctx)
 	if !ok || tree.TreeId != treeID {
 		var err error
-		tree, err = getTreeFromStorage(ctx, s, treeID)
+		tree, err = storage.GetTree(ctx, s, treeID)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	switch {
-	case opts.TreeType != trillian.TreeType_UNKNOWN_TREE_TYPE && tree.TreeType != opts.TreeType:
-		return nil, errors.Errorf(errors.InvalidArgument, "operation not allowed for %s-type trees (wanted %s-type)", tree.TreeType, opts.TreeType)
-	case tree.TreeState == trillian.TreeState_FROZEN && !opts.Readonly:
-		return nil, errors.Errorf(errors.FailedPrecondition, "operation not allowed on %s trees", tree.TreeState)
-	case tree.TreeState == trillian.TreeState_SOFT_DELETED || tree.TreeState == trillian.TreeState_HARD_DELETED:
-		return nil, errors.Errorf(errors.NotFound, "deleted tree: %v", tree.TreeId)
+	if err := validate(opts, tree); err != nil {
+		return nil, err
+	}
+	if tree.Deleted {
+		return nil, status.Errorf(codes.NotFound, "tree %v not found", tree.TreeId)
 	}
 
-	return tree, nil
-}
-
-func getTreeFromStorage(ctx context.Context, s storage.AdminStorage, treeID int64) (*trillian.Tree, error) {
-	tx, err := s.Snapshot(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Close()
-	tree, err := tx.GetTree(ctx, treeID)
-	if err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
 	return tree, nil
 }
 
@@ -131,5 +212,9 @@ func Signer(ctx context.Context, tree *trillian.Tree) (*tcrypto.Signer, error) {
 		return nil, fmt.Errorf("%s signature not supported by signer of type %T", tree.SignatureAlgorithm, signer)
 	}
 
-	return &tcrypto.Signer{Hash: hash, Signer: signer}, nil
+	return tcrypto.NewSigner(tree.GetTreeId(), signer, hash), nil
+}
+
+func spanFor(ctx context.Context, name string) (context.Context, func()) {
+	return monitoring.StartSpan(ctx, fmt.Sprintf("%s.%s", traceSpanRoot, name))
 }

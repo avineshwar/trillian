@@ -229,7 +229,9 @@ func (mt *InMemoryMerkleTree) popBack(level int64) {
 // Returns the position of the leaf in the tree. Indexing starts at 1,
 // so position = number of leaves in the tree after this update.
 func (mt *InMemoryMerkleTree) AddLeaf(leafData []byte) (int64, TreeEntry) {
-	return mt.addLeafHash(mt.hasher.HashLeaf(leafData))
+	leafHash := mt.hasher.HashLeaf(leafData)
+	leafCount, treeEntry := mt.addLeafHash(leafHash)
+	return leafCount, treeEntry
 }
 
 func (mt *InMemoryMerkleTree) addLeafHash(leafData []byte) (int64, TreeEntry) {
@@ -521,4 +523,14 @@ func (mt *InMemoryMerkleTree) SnapshotConsistency(snapshot1 int64, snapshot2 int
 	path := mt.pathFromNodeToRootAtSnapshot(node, level, snapshot2)
 
 	return append(proof, path...)
+}
+
+// parent returns the index of the parent node in the parent level of the tree.
+func parent(index int64) int64 {
+	return index >> 1
+}
+
+// isRightChild returns true if the node is a right child.
+func isRightChild(index int64) bool {
+	return index&1 == 1
 }

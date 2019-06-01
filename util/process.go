@@ -15,6 +15,7 @@
 package util
 
 import (
+	"context"
 	"net"
 	"net/http"
 	"os"
@@ -25,30 +26,42 @@ import (
 )
 
 // StartHTTPServer starts an HTTP server on the given address.
-func StartHTTPServer(addr string) error {
+func StartHTTPServer(addr, certFile, keyFile string) error {
 	sock, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
 	go func() {
 		glog.Info("HTTP server starting")
-		http.Serve(sock, nil)
+		// Let http.ServeTLS handle the error case when only one of the flags is set.
+		if certFile != "" || keyFile != "" {
+			err = http.ServeTLS(sock, nil, certFile, keyFile)
+		} else {
+			err = http.Serve(sock, nil)
+		}
+		if err != nil {
+			glog.Errorf("HTTP server stopped: %v", err)
+		}
 	}()
 
 	return nil
 }
 
 // AwaitSignal waits for standard termination signals, then runs the given
-// function; it should be run as a separate goroutine.
-func AwaitSignal(doneFn func()) {
-	// Arrange notification for the standard set of signals used to terminate a server
+// function. Can early return if the passed in context is canceled, in which
+// case the function is not run.
+func AwaitSignal(ctx context.Context, doneFn func()) {
+	// Subscribe for the standard set of signals used to terminate a server.
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigs)
 
-	// Now block main and wait for a signal
-	sig := <-sigs
-	glog.Warningf("Signal received: %v", sig)
-	glog.Flush()
-
-	doneFn()
+	// Wait for a signal or context cancellation.
+	select {
+	case sig := <-sigs:
+		glog.Warningf("Signal received: %v", sig)
+		doneFn()
+	case <-ctx.Done():
+		glog.Infof("AwaitSignal canceled: %v", ctx.Err())
+	}
 }

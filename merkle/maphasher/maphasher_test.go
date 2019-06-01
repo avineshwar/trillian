@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	"github.com/google/trillian/merkle/hashers"
+	"github.com/google/trillian/testonly"
 )
 
 const (
@@ -29,6 +30,8 @@ const (
 	emptyMapRootB64 = "xmifEIEqCYCXbZUz2Dh1KCFmFZVn7DUVVxbBQTr1PWo="
 	treeID          = int64(0)
 )
+
+var h2b = testonly.MustHexDecode
 
 func TestEmptyRoot(t *testing.T) {
 	emptyRoot, err := base64.StdEncoding.DecodeString(emptyMapRootB64)
@@ -41,12 +44,30 @@ func TestEmptyRoot(t *testing.T) {
 	}
 }
 
+func TestHashLeaf(t *testing.T) {
+	tests := []struct {
+		index, value, want []byte
+	}{
+		{[]byte{0x00}, nil, h2b("6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d")},
+		{[]byte{0x00}, []byte(""), h2b("6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d")},
+		{[]byte{0x01}, []byte(""), h2b("6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d")},
+		{[]byte{0x01}, []byte("foo"), h2b("1d2039fa7971f4bf01a1c20cb2a3fe7af46865ca9cd9b840c2063df8fec4ff75")},
+	}
+	for _, test := range tests {
+		got := Default.HashLeaf(6962, test.index, test.value)
+		if !bytes.Equal(got, test.want) {
+			t.Errorf("HashLeaf(%x)=%x; want %x", test.value, got, test.want)
+		}
+	}
+}
+
 // Compares the old HStar2 empty branch algorithm to the new.
 func TestHStar2Equivalence(t *testing.T) {
 	m := New(crypto.SHA256)
+	leafHash := m.HashLeaf(treeID, nil, []byte(""))
 	star := hstar{
 		hasher:          m,
-		hStarEmptyCache: [][]byte{m.HashLeaf(treeID, nil, []byte(""))},
+		hStarEmptyCache: [][]byte{leafHash},
 	}
 	fullDepth := m.Size() * 8
 	for i := 0; i < fullDepth; i++ {

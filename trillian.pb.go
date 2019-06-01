@@ -3,19 +3,81 @@
 
 package trillian
 
-import proto "github.com/golang/protobuf/proto"
-import fmt "fmt"
-import math "math"
-import keyspb "github.com/google/trillian/crypto/keyspb"
-import sigpb "github.com/google/trillian/crypto/sigpb"
-import google_protobuf "github.com/golang/protobuf/ptypes/any"
-import google_protobuf1 "github.com/golang/protobuf/ptypes/duration"
-import google_protobuf2 "github.com/golang/protobuf/ptypes/timestamp"
+import (
+	fmt "fmt"
+	proto "github.com/golang/protobuf/proto"
+	any "github.com/golang/protobuf/ptypes/any"
+	duration "github.com/golang/protobuf/ptypes/duration"
+	timestamp "github.com/golang/protobuf/ptypes/timestamp"
+	keyspb "github.com/google/trillian/crypto/keyspb"
+	sigpb "github.com/google/trillian/crypto/sigpb"
+	math "math"
+)
 
 // Reference imports to suppress errors if they are not otherwise used.
 var _ = proto.Marshal
 var _ = fmt.Errorf
 var _ = math.Inf
+
+// This is a compile-time assertion to ensure that this generated file
+// is compatible with the proto package it is being compiled against.
+// A compilation error at this line likely means your copy of the
+// proto package needs to be updated.
+const _ = proto.ProtoPackageIsVersion3 // please upgrade the proto package
+
+// LogRootFormat specifies the fields that are covered by the
+// SignedLogRoot signature, as well as their ordering and formats.
+type LogRootFormat int32
+
+const (
+	LogRootFormat_LOG_ROOT_FORMAT_UNKNOWN LogRootFormat = 0
+	LogRootFormat_LOG_ROOT_FORMAT_V1      LogRootFormat = 1
+)
+
+var LogRootFormat_name = map[int32]string{
+	0: "LOG_ROOT_FORMAT_UNKNOWN",
+	1: "LOG_ROOT_FORMAT_V1",
+}
+
+var LogRootFormat_value = map[string]int32{
+	"LOG_ROOT_FORMAT_UNKNOWN": 0,
+	"LOG_ROOT_FORMAT_V1":      1,
+}
+
+func (x LogRootFormat) String() string {
+	return proto.EnumName(LogRootFormat_name, int32(x))
+}
+
+func (LogRootFormat) EnumDescriptor() ([]byte, []int) {
+	return fileDescriptor_364603a4e17a2a56, []int{0}
+}
+
+// MapRootFormat specifies the fields that are covered by the
+// SignedMapRoot signature, as well as their ordering and formats.
+type MapRootFormat int32
+
+const (
+	MapRootFormat_MAP_ROOT_FORMAT_UNKNOWN MapRootFormat = 0
+	MapRootFormat_MAP_ROOT_FORMAT_V1      MapRootFormat = 1
+)
+
+var MapRootFormat_name = map[int32]string{
+	0: "MAP_ROOT_FORMAT_UNKNOWN",
+	1: "MAP_ROOT_FORMAT_V1",
+}
+
+var MapRootFormat_value = map[string]int32{
+	"MAP_ROOT_FORMAT_UNKNOWN": 0,
+	"MAP_ROOT_FORMAT_V1":      1,
+}
+
+func (x MapRootFormat) String() string {
+	return proto.EnumName(MapRootFormat_name, int32(x))
+}
+
+func (MapRootFormat) EnumDescriptor() ([]byte, []int) {
+	return fileDescriptor_364603a4e17a2a56, []int{1}
+}
 
 // Defines the way empty / node / leaf hashes are constructed incorporating
 // preimage protection, which can be application specific.
@@ -37,6 +99,8 @@ const (
 	HashStrategy_OBJECT_RFC6962_SHA256 HashStrategy = 3
 	// The CONIKS sparse tree hasher with SHA512_256 as the hash algorithm.
 	HashStrategy_CONIKS_SHA512_256 HashStrategy = 4
+	// The CONIKS sparse tree hasher with SHA256 as the hash algorithm.
+	HashStrategy_CONIKS_SHA256 HashStrategy = 5
 )
 
 var HashStrategy_name = map[int32]string{
@@ -45,19 +109,25 @@ var HashStrategy_name = map[int32]string{
 	2: "TEST_MAP_HASHER",
 	3: "OBJECT_RFC6962_SHA256",
 	4: "CONIKS_SHA512_256",
+	5: "CONIKS_SHA256",
 }
+
 var HashStrategy_value = map[string]int32{
 	"UNKNOWN_HASH_STRATEGY": 0,
 	"RFC6962_SHA256":        1,
 	"TEST_MAP_HASHER":       2,
 	"OBJECT_RFC6962_SHA256": 3,
 	"CONIKS_SHA512_256":     4,
+	"CONIKS_SHA256":         5,
 }
 
 func (x HashStrategy) String() string {
 	return proto.EnumName(HashStrategy_name, int32(x))
 }
-func (HashStrategy) EnumDescriptor() ([]byte, []int) { return fileDescriptor3, []int{0} }
+
+func (HashStrategy) EnumDescriptor() ([]byte, []int) {
+	return fileDescriptor_364603a4e17a2a56, []int{2}
+}
 
 // State of the tree.
 type TreeState int32
@@ -69,133 +139,178 @@ const (
 	// Active trees are able to respond to both read and write requests.
 	TreeState_ACTIVE TreeState = 1
 	// Frozen trees are only able to respond to read requests, writing to a frozen
-	// tree is forbidden.
+	// tree is forbidden. Trees should not be frozen when there are entries
+	// in the queue that have not yet been integrated. See the DRAINING
+	// state for this case.
 	TreeState_FROZEN TreeState = 2
-	// Tree was been deleted, therefore is invisible and acts similarly to a
-	// non-existing tree for all requests.
-	// A soft deleted tree may be undeleted while the soft-deletion period has not
-	// passed.
-	TreeState_SOFT_DELETED TreeState = 3
-	// A hard deleted tree was been definitely deleted and cannot be recovered.
-	// Acts an a non-existing tree for all read and write requests, but blocks the
-	// tree ID from ever being reused.
-	TreeState_HARD_DELETED TreeState = 4
+	// Deprecated: now tracked in Tree.deleted.
+	TreeState_DEPRECATED_SOFT_DELETED TreeState = 3 // Deprecated: Do not use.
+	// Deprecated: now tracked in Tree.deleted.
+	TreeState_DEPRECATED_HARD_DELETED TreeState = 4 // Deprecated: Do not use.
+	// A tree that is draining will continue to integrate queued entries.
+	// No new entries should be accepted.
+	TreeState_DRAINING TreeState = 5
 )
 
 var TreeState_name = map[int32]string{
 	0: "UNKNOWN_TREE_STATE",
 	1: "ACTIVE",
 	2: "FROZEN",
-	3: "SOFT_DELETED",
-	4: "HARD_DELETED",
+	3: "DEPRECATED_SOFT_DELETED",
+	4: "DEPRECATED_HARD_DELETED",
+	5: "DRAINING",
 }
+
 var TreeState_value = map[string]int32{
-	"UNKNOWN_TREE_STATE": 0,
-	"ACTIVE":             1,
-	"FROZEN":             2,
-	"SOFT_DELETED":       3,
-	"HARD_DELETED":       4,
+	"UNKNOWN_TREE_STATE":      0,
+	"ACTIVE":                  1,
+	"FROZEN":                  2,
+	"DEPRECATED_SOFT_DELETED": 3,
+	"DEPRECATED_HARD_DELETED": 4,
+	"DRAINING":                5,
 }
 
 func (x TreeState) String() string {
 	return proto.EnumName(TreeState_name, int32(x))
 }
-func (TreeState) EnumDescriptor() ([]byte, []int) { return fileDescriptor3, []int{1} }
+
+func (TreeState) EnumDescriptor() ([]byte, []int) {
+	return fileDescriptor_364603a4e17a2a56, []int{3}
+}
 
 // Type of the tree.
 type TreeType int32
 
 const (
-	// Tree type cannot be determined. Included to enable detection of
-	// mismatched proto versions being used. Represents an invalid value.
+	// Tree type cannot be determined. Included to enable detection of mismatched
+	// proto versions being used. Represents an invalid value.
 	TreeType_UNKNOWN_TREE_TYPE TreeType = 0
 	// Tree represents a verifiable log.
 	TreeType_LOG TreeType = 1
 	// Tree represents a verifiable map.
 	TreeType_MAP TreeType = 2
+	// Tree represents a verifiable pre-ordered log, i.e., a log whose entries are
+	// placed according to sequence numbers assigned outside of Trillian.
+	TreeType_PREORDERED_LOG TreeType = 3
 )
 
 var TreeType_name = map[int32]string{
 	0: "UNKNOWN_TREE_TYPE",
 	1: "LOG",
 	2: "MAP",
+	3: "PREORDERED_LOG",
 }
+
 var TreeType_value = map[string]int32{
 	"UNKNOWN_TREE_TYPE": 0,
 	"LOG":               1,
 	"MAP":               2,
+	"PREORDERED_LOG":    3,
 }
 
 func (x TreeType) String() string {
 	return proto.EnumName(TreeType_name, int32(x))
 }
-func (TreeType) EnumDescriptor() ([]byte, []int) { return fileDescriptor3, []int{2} }
+
+func (TreeType) EnumDescriptor() ([]byte, []int) {
+	return fileDescriptor_364603a4e17a2a56, []int{4}
+}
 
 // Represents a tree, which may be either a verifiable log or map.
 // Readonly attributes are assigned at tree creation, after which they may not
 // be modified.
+//
+// Note: Many APIs within the rest of the code require these objects to
+// be provided. For safety they should be obtained via Admin API calls and
+// not created dynamically.
 type Tree struct {
 	// ID of the tree.
 	// Readonly.
-	TreeId int64 `protobuf:"varint,1,opt,name=tree_id,json=treeId" json:"tree_id,omitempty"`
+	TreeId int64 `protobuf:"varint,1,opt,name=tree_id,json=treeId,proto3" json:"tree_id,omitempty"`
 	// State of the tree.
-	// Trees are active after creation. At any point the tree may transition
-	// between ACTIVE and FROZEN.
-	// Deleted trees are set as SOFT_DELETED for a certain time period, after
-	// which they'll automatically transition to HARD_DELETED.
-	TreeState TreeState `protobuf:"varint,2,opt,name=tree_state,json=treeState,enum=trillian.TreeState" json:"tree_state,omitempty"`
+	// Trees are ACTIVE after creation. At any point the tree may transition
+	// between ACTIVE, DRAINING and FROZEN states.
+	TreeState TreeState `protobuf:"varint,2,opt,name=tree_state,json=treeState,proto3,enum=trillian.TreeState" json:"tree_state,omitempty"`
 	// Type of the tree.
-	// Readonly.
-	TreeType TreeType `protobuf:"varint,3,opt,name=tree_type,json=treeType,enum=trillian.TreeType" json:"tree_type,omitempty"`
+	// Readonly after Tree creation. Exception: Can be switched from
+	// PREORDERED_LOG to LOG if the Tree is and remains in the FROZEN state.
+	TreeType TreeType `protobuf:"varint,3,opt,name=tree_type,json=treeType,proto3,enum=trillian.TreeType" json:"tree_type,omitempty"`
 	// Hash strategy to be used by the tree.
 	// Readonly.
-	HashStrategy HashStrategy `protobuf:"varint,4,opt,name=hash_strategy,json=hashStrategy,enum=trillian.HashStrategy" json:"hash_strategy,omitempty"`
+	HashStrategy HashStrategy `protobuf:"varint,4,opt,name=hash_strategy,json=hashStrategy,proto3,enum=trillian.HashStrategy" json:"hash_strategy,omitempty"`
 	// Hash algorithm to be used by the tree.
 	// Readonly.
-	// TODO(gdbelvin): Deprecate in favor of signature_cipher_suite and hash_strategy.
-	HashAlgorithm sigpb.DigitallySigned_HashAlgorithm `protobuf:"varint,5,opt,name=hash_algorithm,json=hashAlgorithm,enum=sigpb.DigitallySigned_HashAlgorithm" json:"hash_algorithm,omitempty"`
+	HashAlgorithm sigpb.DigitallySigned_HashAlgorithm `protobuf:"varint,5,opt,name=hash_algorithm,json=hashAlgorithm,proto3,enum=sigpb.DigitallySigned_HashAlgorithm" json:"hash_algorithm,omitempty"`
 	// Signature algorithm to be used by the tree.
 	// Readonly.
-	// TODO(gdbelvin): Deprecate in favor of signature_cipher_suite.
-	SignatureAlgorithm sigpb.DigitallySigned_SignatureAlgorithm `protobuf:"varint,6,opt,name=signature_algorithm,json=signatureAlgorithm,enum=sigpb.DigitallySigned_SignatureAlgorithm" json:"signature_algorithm,omitempty"`
-	// Signature cipher suite specifies the algorithms used to generate signatures.
-	SignatureCipherSuite sigpb.DigitallySigned_SignatureCipherSuite `protobuf:"varint,18,opt,name=signature_cipher_suite,json=signatureCipherSuite,enum=sigpb.DigitallySigned_SignatureCipherSuite" json:"signature_cipher_suite,omitempty"`
+	SignatureAlgorithm sigpb.DigitallySigned_SignatureAlgorithm `protobuf:"varint,6,opt,name=signature_algorithm,json=signatureAlgorithm,proto3,enum=sigpb.DigitallySigned_SignatureAlgorithm" json:"signature_algorithm,omitempty"`
 	// Display name of the tree.
 	// Optional.
-	DisplayName string `protobuf:"bytes,8,opt,name=display_name,json=displayName" json:"display_name,omitempty"`
+	DisplayName string `protobuf:"bytes,8,opt,name=display_name,json=displayName,proto3" json:"display_name,omitempty"`
 	// Description of the tree,
 	// Optional.
-	Description string `protobuf:"bytes,9,opt,name=description" json:"description,omitempty"`
+	Description string `protobuf:"bytes,9,opt,name=description,proto3" json:"description,omitempty"`
 	// Identifies the private key used for signing tree heads and entry
 	// timestamps.
 	// This can be any type of message to accommodate different key management
 	// systems, e.g. PEM files, HSMs, etc.
 	// Private keys are write-only: they're never returned by RPCs.
-	// TODO(RJPercival): Implement sufficient validation to allow this field to be
-	// mutable. It should be mutable in the sense that the key can be migrated to
-	// a different key management system, but the key itself should never change.
-	PrivateKey *google_protobuf.Any `protobuf:"bytes,12,opt,name=private_key,json=privateKey" json:"private_key,omitempty"`
+	// The private_key message can be changed after a tree is created, but the
+	// underlying key must remain the same - this is to enable migrating a key
+	// from one provider to another.
+	PrivateKey *any.Any `protobuf:"bytes,12,opt,name=private_key,json=privateKey,proto3" json:"private_key,omitempty"`
 	// Storage-specific settings.
 	// Varies according to the storage implementation backing Trillian.
-	StorageSettings *google_protobuf.Any `protobuf:"bytes,13,opt,name=storage_settings,json=storageSettings" json:"storage_settings,omitempty"`
+	StorageSettings *any.Any `protobuf:"bytes,13,opt,name=storage_settings,json=storageSettings,proto3" json:"storage_settings,omitempty"`
 	// The public key used for verifying tree heads and entry timestamps.
 	// Readonly.
-	PublicKey *keyspb.PublicKey `protobuf:"bytes,14,opt,name=public_key,json=publicKey" json:"public_key,omitempty"`
+	PublicKey *keyspb.PublicKey `protobuf:"bytes,14,opt,name=public_key,json=publicKey,proto3" json:"public_key,omitempty"`
 	// Interval after which a new signed root is produced even if there have been
 	// no submission.  If zero, this behavior is disabled.
-	MaxRootDuration *google_protobuf1.Duration `protobuf:"bytes,15,opt,name=max_root_duration,json=maxRootDuration" json:"max_root_duration,omitempty"`
+	MaxRootDuration *duration.Duration `protobuf:"bytes,15,opt,name=max_root_duration,json=maxRootDuration,proto3" json:"max_root_duration,omitempty"`
 	// Time of tree creation.
 	// Readonly.
-	CreateTime *google_protobuf2.Timestamp `protobuf:"bytes,16,opt,name=create_time,json=createTime" json:"create_time,omitempty"`
+	CreateTime *timestamp.Timestamp `protobuf:"bytes,16,opt,name=create_time,json=createTime,proto3" json:"create_time,omitempty"`
 	// Time of last tree update.
 	// Readonly (automatically assigned on updates).
-	UpdateTime *google_protobuf2.Timestamp `protobuf:"bytes,17,opt,name=update_time,json=updateTime" json:"update_time,omitempty"`
+	UpdateTime *timestamp.Timestamp `protobuf:"bytes,17,opt,name=update_time,json=updateTime,proto3" json:"update_time,omitempty"`
+	// If true, the tree has been deleted.
+	// Deleted trees may be undeleted during a certain time window, after which
+	// they're permanently deleted (and unrecoverable).
+	// Readonly.
+	Deleted bool `protobuf:"varint,19,opt,name=deleted,proto3" json:"deleted,omitempty"`
+	// Time of tree deletion, if any.
+	// Readonly.
+	DeleteTime           *timestamp.Timestamp `protobuf:"bytes,20,opt,name=delete_time,json=deleteTime,proto3" json:"delete_time,omitempty"`
+	XXX_NoUnkeyedLiteral struct{}             `json:"-"`
+	XXX_unrecognized     []byte               `json:"-"`
+	XXX_sizecache        int32                `json:"-"`
 }
 
-func (m *Tree) Reset()                    { *m = Tree{} }
-func (m *Tree) String() string            { return proto.CompactTextString(m) }
-func (*Tree) ProtoMessage()               {}
-func (*Tree) Descriptor() ([]byte, []int) { return fileDescriptor3, []int{0} }
+func (m *Tree) Reset()         { *m = Tree{} }
+func (m *Tree) String() string { return proto.CompactTextString(m) }
+func (*Tree) ProtoMessage()    {}
+func (*Tree) Descriptor() ([]byte, []int) {
+	return fileDescriptor_364603a4e17a2a56, []int{0}
+}
+
+func (m *Tree) XXX_Unmarshal(b []byte) error {
+	return xxx_messageInfo_Tree.Unmarshal(m, b)
+}
+func (m *Tree) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	return xxx_messageInfo_Tree.Marshal(b, m, deterministic)
+}
+func (m *Tree) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_Tree.Merge(m, src)
+}
+func (m *Tree) XXX_Size() int {
+	return xxx_messageInfo_Tree.Size(m)
+}
+func (m *Tree) XXX_DiscardUnknown() {
+	xxx_messageInfo_Tree.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_Tree proto.InternalMessageInfo
 
 func (m *Tree) GetTreeId() int64 {
 	if m != nil {
@@ -239,13 +354,6 @@ func (m *Tree) GetSignatureAlgorithm() sigpb.DigitallySigned_SignatureAlgorithm 
 	return sigpb.DigitallySigned_ANONYMOUS
 }
 
-func (m *Tree) GetSignatureCipherSuite() sigpb.DigitallySigned_SignatureCipherSuite {
-	if m != nil {
-		return m.SignatureCipherSuite
-	}
-	return sigpb.DigitallySigned_UNKNOWN_CIPHER_SUITE
-}
-
 func (m *Tree) GetDisplayName() string {
 	if m != nil {
 		return m.DisplayName
@@ -260,14 +368,14 @@ func (m *Tree) GetDescription() string {
 	return ""
 }
 
-func (m *Tree) GetPrivateKey() *google_protobuf.Any {
+func (m *Tree) GetPrivateKey() *any.Any {
 	if m != nil {
 		return m.PrivateKey
 	}
 	return nil
 }
 
-func (m *Tree) GetStorageSettings() *google_protobuf.Any {
+func (m *Tree) GetStorageSettings() *any.Any {
 	if m != nil {
 		return m.StorageSettings
 	}
@@ -281,37 +389,74 @@ func (m *Tree) GetPublicKey() *keyspb.PublicKey {
 	return nil
 }
 
-func (m *Tree) GetMaxRootDuration() *google_protobuf1.Duration {
+func (m *Tree) GetMaxRootDuration() *duration.Duration {
 	if m != nil {
 		return m.MaxRootDuration
 	}
 	return nil
 }
 
-func (m *Tree) GetCreateTime() *google_protobuf2.Timestamp {
+func (m *Tree) GetCreateTime() *timestamp.Timestamp {
 	if m != nil {
 		return m.CreateTime
 	}
 	return nil
 }
 
-func (m *Tree) GetUpdateTime() *google_protobuf2.Timestamp {
+func (m *Tree) GetUpdateTime() *timestamp.Timestamp {
 	if m != nil {
 		return m.UpdateTime
 	}
 	return nil
 }
 
-type SignedEntryTimestamp struct {
-	TimestampNanos int64                  `protobuf:"varint,1,opt,name=timestamp_nanos,json=timestampNanos" json:"timestamp_nanos,omitempty"`
-	LogId          int64                  `protobuf:"varint,2,opt,name=log_id,json=logId" json:"log_id,omitempty"`
-	Signature      *sigpb.DigitallySigned `protobuf:"bytes,3,opt,name=signature" json:"signature,omitempty"`
+func (m *Tree) GetDeleted() bool {
+	if m != nil {
+		return m.Deleted
+	}
+	return false
 }
 
-func (m *SignedEntryTimestamp) Reset()                    { *m = SignedEntryTimestamp{} }
-func (m *SignedEntryTimestamp) String() string            { return proto.CompactTextString(m) }
-func (*SignedEntryTimestamp) ProtoMessage()               {}
-func (*SignedEntryTimestamp) Descriptor() ([]byte, []int) { return fileDescriptor3, []int{1} }
+func (m *Tree) GetDeleteTime() *timestamp.Timestamp {
+	if m != nil {
+		return m.DeleteTime
+	}
+	return nil
+}
+
+type SignedEntryTimestamp struct {
+	TimestampNanos       int64                  `protobuf:"varint,1,opt,name=timestamp_nanos,json=timestampNanos,proto3" json:"timestamp_nanos,omitempty"`
+	LogId                int64                  `protobuf:"varint,2,opt,name=log_id,json=logId,proto3" json:"log_id,omitempty"`
+	Signature            *sigpb.DigitallySigned `protobuf:"bytes,3,opt,name=signature,proto3" json:"signature,omitempty"`
+	XXX_NoUnkeyedLiteral struct{}               `json:"-"`
+	XXX_unrecognized     []byte                 `json:"-"`
+	XXX_sizecache        int32                  `json:"-"`
+}
+
+func (m *SignedEntryTimestamp) Reset()         { *m = SignedEntryTimestamp{} }
+func (m *SignedEntryTimestamp) String() string { return proto.CompactTextString(m) }
+func (*SignedEntryTimestamp) ProtoMessage()    {}
+func (*SignedEntryTimestamp) Descriptor() ([]byte, []int) {
+	return fileDescriptor_364603a4e17a2a56, []int{1}
+}
+
+func (m *SignedEntryTimestamp) XXX_Unmarshal(b []byte) error {
+	return xxx_messageInfo_SignedEntryTimestamp.Unmarshal(m, b)
+}
+func (m *SignedEntryTimestamp) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	return xxx_messageInfo_SignedEntryTimestamp.Marshal(b, m, deterministic)
+}
+func (m *SignedEntryTimestamp) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_SignedEntryTimestamp.Merge(m, src)
+}
+func (m *SignedEntryTimestamp) XXX_Size() int {
+	return xxx_messageInfo_SignedEntryTimestamp.Size(m)
+}
+func (m *SignedEntryTimestamp) XXX_DiscardUnknown() {
+	xxx_messageInfo_SignedEntryTimestamp.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_SignedEntryTimestamp proto.InternalMessageInfo
 
 func (m *SignedEntryTimestamp) GetTimestampNanos() int64 {
 	if m != nil {
@@ -336,232 +481,247 @@ func (m *SignedEntryTimestamp) GetSignature() *sigpb.DigitallySigned {
 
 // SignedLogRoot represents a commitment by a Log to a particular tree.
 type SignedLogRoot struct {
-	// epoch nanoseconds, good until 2500ish
-	TimestampNanos int64  `protobuf:"varint,1,opt,name=timestamp_nanos,json=timestampNanos" json:"timestamp_nanos,omitempty"`
-	RootHash       []byte `protobuf:"bytes,2,opt,name=root_hash,json=rootHash,proto3" json:"root_hash,omitempty"`
-	// TreeSize is the number of entries in the tree.
-	TreeSize     int64                  `protobuf:"varint,3,opt,name=tree_size,json=treeSize" json:"tree_size,omitempty"`
-	Signature    *sigpb.DigitallySigned `protobuf:"bytes,4,opt,name=signature" json:"signature,omitempty"`
-	LogId        int64                  `protobuf:"varint,5,opt,name=log_id,json=logId" json:"log_id,omitempty"`
-	TreeRevision int64                  `protobuf:"varint,6,opt,name=tree_revision,json=treeRevision" json:"tree_revision,omitempty"`
+	// key_hint is a hint to identify the public key for signature verification.
+	// key_hint is not authenticated and may be incorrect or missing, in which
+	// case all known public keys may be used to verify the signature.
+	// When directly communicating with a Trillian gRPC server, the key_hint will
+	// typically contain the LogID encoded as a big-endian 64-bit integer;
+	// however, in other contexts the key_hint is likely to have different
+	// contents (e.g. it could be a GUID, a URL + TreeID, or it could be
+	// derived from the public key itself).
+	KeyHint []byte `protobuf:"bytes,7,opt,name=key_hint,json=keyHint,proto3" json:"key_hint,omitempty"`
+	// log_root holds the TLS-serialization of the following structure (described
+	// in RFC5246 notation): Clients should validate log_root_signature with
+	// VerifySignedLogRoot before deserializing log_root.
+	// enum { v1(1), (65535)} Version;
+	// struct {
+	//   uint64 tree_size;
+	//   opaque root_hash<0..128>;
+	//   uint64 timestamp_nanos;
+	//   uint64 revision;
+	//   opaque metadata<0..65535>;
+	// } LogRootV1;
+	// struct {
+	//   Version version;
+	//   select(version) {
+	//     case v1: LogRootV1;
+	//   }
+	// } LogRoot;
+	//
+	// A serialized v1 log root will therefore be laid out as:
+	//
+	// +---+---+---+---+---+---+---+---+---+---+---+---+---+---+-....--+
+	// | ver=1 |          tree_size            |len|    root_hashlen   |
+	// +---+---+---+---+---+---+---+---+---+---+---+---+---+---+-....--+
+	//
+	// +---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+
+	// |        timestamp_nanos        |      revision                 |
+	// +---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+
+	//
+	// +---+---+---+---+---+-....---+
+	// |  len  |    metadata        |
+	// +---+---+---+---+---+-....---+
+	//
+	// (with all integers encoded big-endian).
+	LogRoot []byte `protobuf:"bytes,8,opt,name=log_root,json=logRoot,proto3" json:"log_root,omitempty"`
+	// log_root_signature is the raw signature over log_root.
+	LogRootSignature     []byte   `protobuf:"bytes,9,opt,name=log_root_signature,json=logRootSignature,proto3" json:"log_root_signature,omitempty"`
+	XXX_NoUnkeyedLiteral struct{} `json:"-"`
+	XXX_unrecognized     []byte   `json:"-"`
+	XXX_sizecache        int32    `json:"-"`
 }
 
-func (m *SignedLogRoot) Reset()                    { *m = SignedLogRoot{} }
-func (m *SignedLogRoot) String() string            { return proto.CompactTextString(m) }
-func (*SignedLogRoot) ProtoMessage()               {}
-func (*SignedLogRoot) Descriptor() ([]byte, []int) { return fileDescriptor3, []int{2} }
-
-func (m *SignedLogRoot) GetTimestampNanos() int64 {
-	if m != nil {
-		return m.TimestampNanos
-	}
-	return 0
+func (m *SignedLogRoot) Reset()         { *m = SignedLogRoot{} }
+func (m *SignedLogRoot) String() string { return proto.CompactTextString(m) }
+func (*SignedLogRoot) ProtoMessage()    {}
+func (*SignedLogRoot) Descriptor() ([]byte, []int) {
+	return fileDescriptor_364603a4e17a2a56, []int{2}
 }
 
-func (m *SignedLogRoot) GetRootHash() []byte {
+func (m *SignedLogRoot) XXX_Unmarshal(b []byte) error {
+	return xxx_messageInfo_SignedLogRoot.Unmarshal(m, b)
+}
+func (m *SignedLogRoot) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	return xxx_messageInfo_SignedLogRoot.Marshal(b, m, deterministic)
+}
+func (m *SignedLogRoot) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_SignedLogRoot.Merge(m, src)
+}
+func (m *SignedLogRoot) XXX_Size() int {
+	return xxx_messageInfo_SignedLogRoot.Size(m)
+}
+func (m *SignedLogRoot) XXX_DiscardUnknown() {
+	xxx_messageInfo_SignedLogRoot.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_SignedLogRoot proto.InternalMessageInfo
+
+func (m *SignedLogRoot) GetKeyHint() []byte {
 	if m != nil {
-		return m.RootHash
+		return m.KeyHint
 	}
 	return nil
 }
 
-func (m *SignedLogRoot) GetTreeSize() int64 {
+func (m *SignedLogRoot) GetLogRoot() []byte {
 	if m != nil {
-		return m.TreeSize
-	}
-	return 0
-}
-
-func (m *SignedLogRoot) GetSignature() *sigpb.DigitallySigned {
-	if m != nil {
-		return m.Signature
+		return m.LogRoot
 	}
 	return nil
 }
 
-func (m *SignedLogRoot) GetLogId() int64 {
+func (m *SignedLogRoot) GetLogRootSignature() []byte {
 	if m != nil {
-		return m.LogId
-	}
-	return 0
-}
-
-func (m *SignedLogRoot) GetTreeRevision() int64 {
-	if m != nil {
-		return m.TreeRevision
-	}
-	return 0
-}
-
-type MapperMetadata struct {
-	SourceLogId                  []byte `protobuf:"bytes,1,opt,name=source_log_id,json=sourceLogId,proto3" json:"source_log_id,omitempty"`
-	HighestFullyCompletedSeq     int64  `protobuf:"varint,2,opt,name=highest_fully_completed_seq,json=highestFullyCompletedSeq" json:"highest_fully_completed_seq,omitempty"`
-	HighestPartiallyCompletedSeq int64  `protobuf:"varint,3,opt,name=highest_partially_completed_seq,json=highestPartiallyCompletedSeq" json:"highest_partially_completed_seq,omitempty"`
-}
-
-func (m *MapperMetadata) Reset()                    { *m = MapperMetadata{} }
-func (m *MapperMetadata) String() string            { return proto.CompactTextString(m) }
-func (*MapperMetadata) ProtoMessage()               {}
-func (*MapperMetadata) Descriptor() ([]byte, []int) { return fileDescriptor3, []int{3} }
-
-func (m *MapperMetadata) GetSourceLogId() []byte {
-	if m != nil {
-		return m.SourceLogId
+		return m.LogRootSignature
 	}
 	return nil
-}
-
-func (m *MapperMetadata) GetHighestFullyCompletedSeq() int64 {
-	if m != nil {
-		return m.HighestFullyCompletedSeq
-	}
-	return 0
-}
-
-func (m *MapperMetadata) GetHighestPartiallyCompletedSeq() int64 {
-	if m != nil {
-		return m.HighestPartiallyCompletedSeq
-	}
-	return 0
 }
 
 // SignedMapRoot represents a commitment by a Map to a particular tree.
 type SignedMapRoot struct {
-	TimestampNanos int64           `protobuf:"varint,1,opt,name=timestamp_nanos,json=timestampNanos" json:"timestamp_nanos,omitempty"`
-	RootHash       []byte          `protobuf:"bytes,2,opt,name=root_hash,json=rootHash,proto3" json:"root_hash,omitempty"`
-	Metadata       *MapperMetadata `protobuf:"bytes,3,opt,name=metadata" json:"metadata,omitempty"`
-	// TODO(al): define serialized format for the signature scheme.
-	Signature   *sigpb.DigitallySigned `protobuf:"bytes,4,opt,name=signature" json:"signature,omitempty"`
-	MapId       int64                  `protobuf:"varint,5,opt,name=map_id,json=mapId" json:"map_id,omitempty"`
-	MapRevision int64                  `protobuf:"varint,6,opt,name=map_revision,json=mapRevision" json:"map_revision,omitempty"`
+	// map_root holds the TLS-serialization of the following structure (described
+	// in RFC5246 notation): Clients should validate signature with
+	// VerifySignedMapRoot before deserializing map_root.
+	// enum { v1(1), (65535)} Version;
+	// struct {
+	//   opaque root_hash<0..128>;
+	//   uint64 timestamp_nanos;
+	//   uint64 revision;
+	//   opaque metadata<0..65535>;
+	// } MapRootV1;
+	// struct {
+	//   Version version;
+	//   select(version) {
+	//     case v1: MapRootV1;
+	//   }
+	// } MapRoot;
+	MapRoot []byte `protobuf:"bytes,9,opt,name=map_root,json=mapRoot,proto3" json:"map_root,omitempty"`
+	// Signature is the raw signature over MapRoot.
+	Signature            []byte   `protobuf:"bytes,4,opt,name=signature,proto3" json:"signature,omitempty"`
+	XXX_NoUnkeyedLiteral struct{} `json:"-"`
+	XXX_unrecognized     []byte   `json:"-"`
+	XXX_sizecache        int32    `json:"-"`
 }
 
-func (m *SignedMapRoot) Reset()                    { *m = SignedMapRoot{} }
-func (m *SignedMapRoot) String() string            { return proto.CompactTextString(m) }
-func (*SignedMapRoot) ProtoMessage()               {}
-func (*SignedMapRoot) Descriptor() ([]byte, []int) { return fileDescriptor3, []int{4} }
-
-func (m *SignedMapRoot) GetTimestampNanos() int64 {
-	if m != nil {
-		return m.TimestampNanos
-	}
-	return 0
+func (m *SignedMapRoot) Reset()         { *m = SignedMapRoot{} }
+func (m *SignedMapRoot) String() string { return proto.CompactTextString(m) }
+func (*SignedMapRoot) ProtoMessage()    {}
+func (*SignedMapRoot) Descriptor() ([]byte, []int) {
+	return fileDescriptor_364603a4e17a2a56, []int{3}
 }
 
-func (m *SignedMapRoot) GetRootHash() []byte {
+func (m *SignedMapRoot) XXX_Unmarshal(b []byte) error {
+	return xxx_messageInfo_SignedMapRoot.Unmarshal(m, b)
+}
+func (m *SignedMapRoot) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	return xxx_messageInfo_SignedMapRoot.Marshal(b, m, deterministic)
+}
+func (m *SignedMapRoot) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_SignedMapRoot.Merge(m, src)
+}
+func (m *SignedMapRoot) XXX_Size() int {
+	return xxx_messageInfo_SignedMapRoot.Size(m)
+}
+func (m *SignedMapRoot) XXX_DiscardUnknown() {
+	xxx_messageInfo_SignedMapRoot.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_SignedMapRoot proto.InternalMessageInfo
+
+func (m *SignedMapRoot) GetMapRoot() []byte {
 	if m != nil {
-		return m.RootHash
+		return m.MapRoot
 	}
 	return nil
 }
 
-func (m *SignedMapRoot) GetMetadata() *MapperMetadata {
-	if m != nil {
-		return m.Metadata
-	}
-	return nil
-}
-
-func (m *SignedMapRoot) GetSignature() *sigpb.DigitallySigned {
+func (m *SignedMapRoot) GetSignature() []byte {
 	if m != nil {
 		return m.Signature
 	}
 	return nil
 }
 
-func (m *SignedMapRoot) GetMapId() int64 {
-	if m != nil {
-		return m.MapId
-	}
-	return 0
-}
-
-func (m *SignedMapRoot) GetMapRevision() int64 {
-	if m != nil {
-		return m.MapRevision
-	}
-	return 0
-}
-
 func init() {
-	proto.RegisterType((*Tree)(nil), "trillian.Tree")
-	proto.RegisterType((*SignedEntryTimestamp)(nil), "trillian.SignedEntryTimestamp")
-	proto.RegisterType((*SignedLogRoot)(nil), "trillian.SignedLogRoot")
-	proto.RegisterType((*MapperMetadata)(nil), "trillian.MapperMetadata")
-	proto.RegisterType((*SignedMapRoot)(nil), "trillian.SignedMapRoot")
+	proto.RegisterEnum("trillian.LogRootFormat", LogRootFormat_name, LogRootFormat_value)
+	proto.RegisterEnum("trillian.MapRootFormat", MapRootFormat_name, MapRootFormat_value)
 	proto.RegisterEnum("trillian.HashStrategy", HashStrategy_name, HashStrategy_value)
 	proto.RegisterEnum("trillian.TreeState", TreeState_name, TreeState_value)
 	proto.RegisterEnum("trillian.TreeType", TreeType_name, TreeType_value)
+	proto.RegisterType((*Tree)(nil), "trillian.Tree")
+	proto.RegisterType((*SignedEntryTimestamp)(nil), "trillian.SignedEntryTimestamp")
+	proto.RegisterType((*SignedLogRoot)(nil), "trillian.SignedLogRoot")
+	proto.RegisterType((*SignedMapRoot)(nil), "trillian.SignedMapRoot")
 }
 
-func init() { proto.RegisterFile("trillian.proto", fileDescriptor3) }
+func init() { proto.RegisterFile("trillian.proto", fileDescriptor_364603a4e17a2a56) }
 
-var fileDescriptor3 = []byte{
-	// 1055 bytes of a gzipped FileDescriptorProto
-	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xac, 0x56, 0x5d, 0x6f, 0xdb, 0x36,
-	0x14, 0xad, 0x62, 0xd7, 0xb1, 0xaf, 0x3f, 0xa2, 0xb0, 0x4d, 0xa6, 0xb8, 0xc3, 0x9a, 0x79, 0x03,
-	0x96, 0x65, 0x80, 0xb3, 0xb9, 0x4d, 0x80, 0xa1, 0x18, 0x06, 0xc7, 0x51, 0xea, 0x7c, 0xd9, 0x86,
-	0xa4, 0x6d, 0x68, 0x5e, 0x08, 0xda, 0x66, 0x65, 0xa2, 0x92, 0xa5, 0x4a, 0x74, 0x51, 0xf5, 0x79,
-	0x8f, 0x03, 0xf6, 0x7f, 0xf6, 0x7b, 0xf6, 0x2f, 0xf6, 0x32, 0x90, 0xa2, 0x64, 0x27, 0xe9, 0xd6,
-	0x62, 0xd8, 0x4b, 0x42, 0x9e, 0x7b, 0xce, 0xe1, 0xc7, 0xbd, 0x97, 0x32, 0x34, 0x78, 0xc4, 0x3c,
-	0x8f, 0x91, 0x79, 0x3b, 0x8c, 0x02, 0x1e, 0xa0, 0x72, 0x36, 0x6f, 0x36, 0x27, 0x51, 0x12, 0xf2,
-	0xe0, 0xe0, 0x15, 0x4d, 0xe2, 0x70, 0xac, 0xfe, 0xa5, 0xac, 0xa6, 0xa1, 0x62, 0x31, 0x73, 0xc3,
-	0x71, 0xfa, 0x57, 0x45, 0x76, 0xdc, 0x20, 0x70, 0x3d, 0x7a, 0x20, 0x67, 0xe3, 0xc5, 0xcb, 0x03,
-	0x32, 0x4f, 0x54, 0xe8, 0xb3, 0xdb, 0xa1, 0xe9, 0x22, 0x22, 0x9c, 0x05, 0x6a, 0xe9, 0xe6, 0xe3,
-	0xdb, 0x71, 0xce, 0x7c, 0x1a, 0x73, 0xe2, 0x87, 0x29, 0xa1, 0xf5, 0xfb, 0x3a, 0x14, 0x9d, 0x88,
-	0x52, 0xf4, 0x09, 0xac, 0xf3, 0x88, 0x52, 0xcc, 0xa6, 0x86, 0xb6, 0xab, 0xed, 0x15, 0xac, 0x92,
-	0x98, 0x9e, 0x4d, 0x51, 0x07, 0x40, 0x06, 0x62, 0x4e, 0x38, 0x35, 0xd6, 0x76, 0xb5, 0xbd, 0x46,
-	0xe7, 0x41, 0x3b, 0x3f, 0xa2, 0x10, 0xdb, 0x22, 0x64, 0x55, 0x78, 0x36, 0x44, 0x07, 0x20, 0x27,
-	0x98, 0x27, 0x21, 0x35, 0x0a, 0x52, 0x82, 0x6e, 0x4a, 0x9c, 0x24, 0xa4, 0x56, 0x99, 0xab, 0x11,
-	0x7a, 0x06, 0xf5, 0x19, 0x89, 0x67, 0x38, 0xe6, 0x11, 0xe1, 0xd4, 0x4d, 0x8c, 0xa2, 0x14, 0x6d,
-	0x2f, 0x45, 0x7d, 0x12, 0xcf, 0x6c, 0x15, 0xb5, 0x6a, 0xb3, 0x95, 0x19, 0xba, 0x80, 0x86, 0x14,
-	0x13, 0xcf, 0x0d, 0x22, 0xc6, 0x67, 0xbe, 0x71, 0x5f, 0xaa, 0xbf, 0x6c, 0xa7, 0xb7, 0x78, 0xc2,
-	0x5c, 0xc6, 0x89, 0xe7, 0x25, 0x36, 0x73, 0xe7, 0x74, 0x2a, 0xad, 0xba, 0x19, 0xd7, 0x92, 0x0b,
-	0xe7, 0x53, 0x74, 0x0d, 0x0f, 0x62, 0xe6, 0xce, 0x09, 0x5f, 0x44, 0x74, 0xc5, 0xb1, 0x24, 0x1d,
-	0xbf, 0xfe, 0x07, 0x47, 0x3b, 0x53, 0x2c, 0x6d, 0x51, 0x7c, 0x07, 0x43, 0x04, 0xb6, 0x97, 0xde,
-	0x13, 0x16, 0xce, 0x68, 0x84, 0xe3, 0x05, 0xe3, 0xd4, 0x40, 0xd2, 0xfe, 0x9b, 0x0f, 0xd9, 0xf7,
-	0xa4, 0xc6, 0x16, 0x12, 0xeb, 0x61, 0xfc, 0x1e, 0x14, 0x7d, 0x0e, 0xb5, 0x29, 0x8b, 0x43, 0x8f,
-	0x24, 0x78, 0x4e, 0x7c, 0x6a, 0x94, 0x77, 0xb5, 0xbd, 0x8a, 0x55, 0x55, 0xd8, 0x80, 0xf8, 0x14,
-	0xed, 0x42, 0x75, 0x4a, 0xe3, 0x49, 0xc4, 0x42, 0x51, 0x28, 0x46, 0x45, 0x31, 0x96, 0x10, 0x3a,
-	0x84, 0x6a, 0x18, 0xb1, 0x37, 0x84, 0x53, 0xfc, 0x8a, 0x26, 0x46, 0x6d, 0x57, 0xdb, 0xab, 0x76,
-	0x1e, 0xb6, 0xd3, 0x5a, 0x6a, 0x67, 0xb5, 0xd4, 0xee, 0xce, 0x13, 0x0b, 0x14, 0xf1, 0x82, 0x26,
-	0xe8, 0x47, 0xd0, 0x63, 0x1e, 0x44, 0xc4, 0xa5, 0x38, 0xa6, 0x9c, 0xb3, 0xb9, 0x1b, 0x1b, 0xf5,
-	0x7f, 0xd1, 0x6e, 0x28, 0xb6, 0xad, 0xc8, 0xe8, 0x5b, 0x80, 0x70, 0x31, 0xf6, 0xd8, 0x44, 0x2e,
-	0xdb, 0x90, 0xd2, 0xcd, 0xb6, 0xea, 0x92, 0x91, 0x8c, 0x5c, 0xd0, 0xc4, 0xaa, 0x84, 0xd9, 0x10,
-	0x99, 0xb0, 0xe9, 0x93, 0xb7, 0x38, 0x0a, 0x02, 0x8e, 0xb3, 0xd2, 0x37, 0x36, 0xa4, 0x70, 0xe7,
-	0xce, 0x9a, 0x27, 0x8a, 0x60, 0x6d, 0xf8, 0xe4, 0xad, 0x15, 0x04, 0x3c, 0x03, 0xd0, 0x33, 0xa8,
-	0x4e, 0x22, 0x2a, 0xce, 0x2b, 0xfa, 0xc3, 0xd0, 0xa5, 0x41, 0xf3, 0x8e, 0x81, 0x93, 0x35, 0x8f,
-	0x05, 0x29, 0x5d, 0x00, 0x42, 0xbc, 0x08, 0xa7, 0xb9, 0x78, 0xf3, 0xc3, 0xe2, 0x94, 0x2e, 0x80,
-	0xf3, 0x62, 0x79, 0x5d, 0x2f, 0x9f, 0x17, 0xcb, 0xa0, 0x57, 0xcf, 0x8b, 0xe5, 0xaa, 0x5e, 0x6b,
-	0xfd, 0xa6, 0xc1, 0xc3, 0x34, 0xef, 0xe6, 0x9c, 0x47, 0x49, 0x2e, 0x43, 0x5f, 0xc1, 0x46, 0xde,
-	0xbd, 0x78, 0x4e, 0xe6, 0x41, 0xac, 0x3a, 0xb5, 0x91, 0xc3, 0x03, 0x81, 0xa2, 0x2d, 0x28, 0x79,
-	0x81, 0x2b, 0x3a, 0x79, 0x4d, 0xc6, 0xef, 0x7b, 0x81, 0x7b, 0x36, 0x45, 0x4f, 0xa1, 0x92, 0x97,
-	0x8c, 0x6c, 0xca, 0x6a, 0x67, 0xfb, 0xfd, 0x05, 0x67, 0x2d, 0x89, 0xad, 0x3f, 0x35, 0xa8, 0xa7,
-	0xe8, 0x65, 0xe0, 0x8a, 0x4b, 0xfb, 0xf8, 0x7d, 0x3c, 0x82, 0x8a, 0x4c, 0x8c, 0x68, 0x30, 0xb9,
-	0x95, 0x9a, 0x55, 0x16, 0x80, 0xe8, 0x3f, 0x11, 0x4c, 0x9f, 0x15, 0xf6, 0x2e, 0xdd, 0x4d, 0x21,
-	0x7d, 0x0e, 0x6c, 0xf6, 0x8e, 0xde, 0xdc, 0x6a, 0xf1, 0x23, 0xb7, 0xba, 0x72, 0xee, 0xfb, 0xab,
-	0xe7, 0xfe, 0x02, 0xea, 0x72, 0xa5, 0x88, 0xbe, 0x61, 0xb1, 0xa8, 0x8f, 0x92, 0x8c, 0xd6, 0x04,
-	0x68, 0x29, 0xac, 0xf5, 0x87, 0x06, 0x8d, 0x2b, 0x12, 0x86, 0x34, 0xba, 0xa2, 0x9c, 0x4c, 0x09,
-	0x27, 0xa8, 0x05, 0xf5, 0x38, 0x58, 0x44, 0x13, 0x8a, 0x95, 0xab, 0x26, 0x8f, 0x50, 0x4d, 0xc1,
-	0x4b, 0xe9, 0xfd, 0x03, 0x3c, 0x9a, 0x31, 0x77, 0x46, 0x63, 0x8e, 0x5f, 0x2e, 0x3c, 0x2f, 0xc1,
-	0x93, 0xc0, 0x0f, 0x3d, 0xca, 0xe9, 0x14, 0xc7, 0xf4, 0xb5, 0xba, 0x7f, 0x43, 0x51, 0x4e, 0x05,
-	0xa3, 0x97, 0x11, 0x6c, 0xfa, 0x1a, 0x99, 0xf0, 0x38, 0x93, 0x87, 0x24, 0xe2, 0x8c, 0xdc, 0xb5,
-	0x48, 0xaf, 0xe6, 0x53, 0x45, 0x1b, 0x65, 0xac, 0x55, 0x9b, 0xd6, 0x5f, 0x79, 0x8e, 0xae, 0x48,
-	0xf8, 0x3f, 0xe6, 0xe8, 0x29, 0x94, 0x7d, 0x75, 0x1b, 0xaa, 0x60, 0x8c, 0xe5, 0x83, 0x7c, 0xf3,
-	0xb6, 0xac, 0x9c, 0xf9, 0xdf, 0x93, 0xe7, 0x93, 0x70, 0x25, 0x79, 0x3e, 0x09, 0xcf, 0xa6, 0xe2,
-	0x3d, 0x13, 0xf0, 0xad, 0xdc, 0x55, 0x7d, 0x12, 0x66, 0xa9, 0xdb, 0xff, 0x55, 0x83, 0xda, 0xea,
-	0xd7, 0x01, 0xed, 0xc0, 0xd6, 0x4f, 0x83, 0x8b, 0xc1, 0xf0, 0x97, 0x01, 0xee, 0x77, 0xed, 0x3e,
-	0xb6, 0x1d, 0xab, 0xeb, 0x98, 0xcf, 0x5f, 0xe8, 0xf7, 0x10, 0x82, 0x86, 0x75, 0xda, 0x3b, 0xfa,
-	0xfe, 0xa8, 0x83, 0xed, 0x7e, 0xb7, 0x73, 0x78, 0xa4, 0x6b, 0xe8, 0x01, 0x6c, 0x38, 0xa6, 0xed,
-	0xe0, 0xab, 0xee, 0x48, 0xf2, 0x4d, 0x4b, 0x5f, 0x13, 0x1e, 0xc3, 0xe3, 0x73, 0xb3, 0xe7, 0xe0,
-	0x5b, 0xfc, 0x02, 0xda, 0x82, 0xcd, 0xde, 0x70, 0x70, 0x76, 0x61, 0x0b, 0xe8, 0xf0, 0xbb, 0x0e,
-	0x16, 0x70, 0x71, 0x1f, 0x43, 0x25, 0xff, 0x16, 0xa2, 0x6d, 0x40, 0xd9, 0x16, 0x1c, 0xcb, 0x34,
-	0xb1, 0xed, 0x74, 0x1d, 0x53, 0xbf, 0x87, 0x00, 0x4a, 0xdd, 0x9e, 0x73, 0xf6, 0xb3, 0xa9, 0x6b,
-	0x62, 0x7c, 0x6a, 0x0d, 0xaf, 0xcd, 0x81, 0xbe, 0x86, 0x74, 0xa8, 0xd9, 0xc3, 0x53, 0x07, 0x9f,
-	0x98, 0x97, 0xa6, 0x63, 0x9e, 0xe8, 0x05, 0x81, 0xf4, 0xbb, 0xd6, 0x49, 0x8e, 0x14, 0xf7, 0x9f,
-	0x40, 0x39, 0xfb, 0x72, 0x8a, 0x3d, 0xdc, 0xf0, 0x77, 0x5e, 0x8c, 0x84, 0xfd, 0x3a, 0x14, 0x2e,
-	0x87, 0xcf, 0x75, 0x4d, 0x0c, 0xae, 0xba, 0x23, 0x7d, 0xed, 0xb8, 0x0f, 0x3b, 0x93, 0xc0, 0xcf,
-	0x1e, 0xa3, 0x9b, 0x3f, 0x4c, 0x8e, 0xeb, 0x8e, 0x9a, 0x8f, 0xc4, 0x74, 0xa4, 0x5d, 0x37, 0x5d,
-	0xc6, 0x67, 0x8b, 0x71, 0x7b, 0x12, 0xf8, 0x07, 0xea, 0x97, 0x43, 0x26, 0x19, 0x97, 0xa4, 0xe6,
-	0xc9, 0xdf, 0x01, 0x00, 0x00, 0xff, 0xff, 0xad, 0xb3, 0x91, 0x8a, 0xde, 0x08, 0x00, 0x00,
+var fileDescriptor_364603a4e17a2a56 = []byte{
+	// 1052 bytes of a gzipped FileDescriptorProto
+	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x84, 0x55, 0x5b, 0x6f, 0xe2, 0x46,
+	0x14, 0x5e, 0x83, 0x01, 0x33, 0x5c, 0x32, 0x99, 0xec, 0xc5, 0xa1, 0x55, 0x97, 0x46, 0x95, 0x4a,
+	0xa3, 0x8a, 0x74, 0x69, 0x13, 0xa9, 0xda, 0x87, 0xca, 0x09, 0x4e, 0x80, 0x24, 0x80, 0xc6, 0xee,
+	0x56, 0x9b, 0x97, 0x91, 0x81, 0xa9, 0xb1, 0xe2, 0x9b, 0xec, 0xa1, 0x5a, 0xff, 0x84, 0xaa, 0x7d,
+	0xdf, 0xbf, 0x5b, 0xcd, 0xf8, 0x42, 0x42, 0x76, 0xbb, 0x2f, 0xc9, 0x9c, 0xf3, 0x5d, 0xce, 0x19,
+	0xcf, 0x19, 0x06, 0xb4, 0x59, 0xe4, 0xb8, 0xae, 0x63, 0xf9, 0xfd, 0x30, 0x0a, 0x58, 0x80, 0x94,
+	0x3c, 0xee, 0x74, 0x96, 0x51, 0x12, 0xb2, 0xe0, 0xe4, 0x9e, 0x26, 0x71, 0xb8, 0xc8, 0xfe, 0xa5,
+	0xac, 0x8e, 0x9a, 0x61, 0xb1, 0x63, 0x87, 0x8b, 0xf4, 0x6f, 0x86, 0x1c, 0xda, 0x41, 0x60, 0xbb,
+	0xf4, 0x44, 0x44, 0x8b, 0xcd, 0x9f, 0x27, 0x96, 0x9f, 0x64, 0xd0, 0x37, 0xbb, 0xd0, 0x6a, 0x13,
+	0x59, 0xcc, 0x09, 0xb2, 0xd2, 0x9d, 0xd7, 0xbb, 0x38, 0x73, 0x3c, 0x1a, 0x33, 0xcb, 0x0b, 0x53,
+	0xc2, 0xd1, 0xdf, 0x35, 0x20, 0x9b, 0x11, 0xa5, 0xe8, 0x15, 0xa8, 0xb1, 0x88, 0x52, 0xe2, 0xac,
+	0x54, 0xa9, 0x2b, 0xf5, 0xca, 0xb8, 0xca, 0xc3, 0xf1, 0x0a, 0x0d, 0x00, 0x10, 0x40, 0xcc, 0x2c,
+	0x46, 0xd5, 0x52, 0x57, 0xea, 0xb5, 0x07, 0x07, 0xfd, 0x62, 0x8b, 0x5c, 0x6c, 0x70, 0x08, 0xd7,
+	0x59, 0xbe, 0x44, 0x27, 0x40, 0x04, 0x84, 0x25, 0x21, 0x55, 0xcb, 0x42, 0x82, 0x1e, 0x4b, 0xcc,
+	0x24, 0xa4, 0x58, 0x61, 0xd9, 0x0a, 0xbd, 0x05, 0xad, 0xb5, 0x15, 0xaf, 0x49, 0xcc, 0x22, 0x8b,
+	0x51, 0x3b, 0x51, 0x65, 0x21, 0x7a, 0xb9, 0x15, 0x8d, 0xac, 0x78, 0x6d, 0x64, 0x28, 0x6e, 0xae,
+	0x1f, 0x44, 0xe8, 0x1a, 0xb4, 0x85, 0xd8, 0x72, 0xed, 0x20, 0x72, 0xd8, 0xda, 0x53, 0x2b, 0x42,
+	0xfd, 0x5d, 0x3f, 0xfd, 0x8a, 0x43, 0xc7, 0x76, 0x98, 0xe5, 0xba, 0x89, 0xe1, 0xd8, 0x3e, 0x5d,
+	0x09, 0x2b, 0x2d, 0xe7, 0x62, 0x51, 0xb8, 0x08, 0xd1, 0x1d, 0x38, 0x88, 0x1d, 0xdb, 0xb7, 0xd8,
+	0x26, 0xa2, 0x0f, 0x1c, 0xab, 0xc2, 0xf1, 0x87, 0xcf, 0x38, 0x1a, 0xb9, 0x62, 0x6b, 0x8b, 0xe2,
+	0x27, 0x39, 0xf4, 0x2d, 0x68, 0xae, 0x9c, 0x38, 0x74, 0xad, 0x84, 0xf8, 0x96, 0x47, 0x55, 0xa5,
+	0x2b, 0xf5, 0xea, 0xb8, 0x91, 0xe5, 0xa6, 0x96, 0x47, 0x51, 0x17, 0x34, 0x56, 0x34, 0x5e, 0x46,
+	0x4e, 0xc8, 0x4f, 0x51, 0xad, 0x67, 0x8c, 0x6d, 0x0a, 0x9d, 0x82, 0x46, 0x18, 0x39, 0x7f, 0x59,
+	0x8c, 0x92, 0x7b, 0x9a, 0xa8, 0xcd, 0xae, 0xd4, 0x6b, 0x0c, 0x9e, 0xf7, 0xd3, 0x83, 0xee, 0xe7,
+	0x07, 0xdd, 0xd7, 0xfc, 0x04, 0x83, 0x8c, 0x78, 0x4d, 0x13, 0xf4, 0x1b, 0x80, 0x31, 0x0b, 0x22,
+	0xcb, 0xa6, 0x24, 0xa6, 0x8c, 0x39, 0xbe, 0x1d, 0xab, 0xad, 0xff, 0xd1, 0xee, 0x65, 0x6c, 0x23,
+	0x23, 0xa3, 0x9f, 0x00, 0x08, 0x37, 0x0b, 0xd7, 0x59, 0x8a, 0xb2, 0x6d, 0x21, 0xdd, 0xef, 0x67,
+	0x23, 0x3c, 0x17, 0xc8, 0x35, 0x4d, 0x70, 0x3d, 0xcc, 0x97, 0x48, 0x07, 0xfb, 0x9e, 0xf5, 0x81,
+	0x44, 0x41, 0xc0, 0x48, 0x3e, 0x97, 0xea, 0x9e, 0x10, 0x1e, 0x3e, 0xa9, 0x39, 0xcc, 0x08, 0x78,
+	0xcf, 0xb3, 0x3e, 0xe0, 0x20, 0x60, 0x79, 0x02, 0xbd, 0x05, 0x8d, 0x65, 0x44, 0xf9, 0x7e, 0xf9,
+	0xf0, 0xaa, 0x50, 0x18, 0x74, 0x9e, 0x18, 0x98, 0xf9, 0x64, 0x63, 0x90, 0xd2, 0x79, 0x82, 0x8b,
+	0x37, 0xe1, 0xaa, 0x10, 0xef, 0x7f, 0x59, 0x9c, 0xd2, 0x85, 0x58, 0x05, 0xb5, 0x15, 0x75, 0x29,
+	0xa3, 0x2b, 0xf5, 0xa0, 0x2b, 0xf5, 0x14, 0x9c, 0x87, 0xdc, 0x36, 0x5d, 0xa6, 0xb6, 0xcf, 0xbf,
+	0x6c, 0x9b, 0xd2, 0x79, 0x62, 0x22, 0x2b, 0x08, 0x1e, 0x4c, 0x64, 0xa5, 0x06, 0x95, 0x89, 0xac,
+	0x00, 0xd8, 0x98, 0xc8, 0x4a, 0x03, 0x36, 0x8f, 0xfe, 0x95, 0xc0, 0xf3, 0x74, 0xa0, 0x74, 0x9f,
+	0x45, 0x49, 0x21, 0x46, 0xdf, 0x83, 0xbd, 0xe2, 0xde, 0x12, 0xdf, 0xf2, 0x83, 0x38, 0xbb, 0xa3,
+	0xed, 0x22, 0x3d, 0xe5, 0x59, 0xf4, 0x02, 0x54, 0xdd, 0xc0, 0xe6, 0x77, 0xb8, 0x24, 0xf0, 0x8a,
+	0x1b, 0xd8, 0xe3, 0x15, 0xfa, 0x05, 0xd4, 0x8b, 0x69, 0x14, 0xd7, 0xb1, 0x31, 0x78, 0xf9, 0xe9,
+	0x49, 0xc6, 0x5b, 0xe2, 0xd1, 0x47, 0x09, 0xb4, 0xd2, 0xec, 0x4d, 0x60, 0xf3, 0x13, 0x41, 0x87,
+	0x40, 0xb9, 0xa7, 0x09, 0x59, 0x3b, 0x3e, 0x53, 0x6b, 0x5d, 0xa9, 0xd7, 0xc4, 0xb5, 0x7b, 0x9a,
+	0x8c, 0x1c, 0x5f, 0x40, 0xbc, 0x32, 0x3f, 0x6b, 0x31, 0xd6, 0x4d, 0x5c, 0x73, 0x33, 0xd5, 0x8f,
+	0x00, 0xe5, 0x10, 0xd9, 0xb6, 0x51, 0x17, 0x24, 0x98, 0x91, 0x8a, 0x0b, 0x34, 0x91, 0x15, 0x09,
+	0x96, 0x26, 0xb2, 0x52, 0x82, 0xe5, 0x89, 0xac, 0x94, 0xa1, 0x3c, 0x91, 0x15, 0x19, 0x56, 0x26,
+	0xb2, 0x52, 0x81, 0xd5, 0x89, 0xac, 0x54, 0x61, 0xed, 0x28, 0xca, 0x1b, 0xbb, 0xb5, 0xc2, 0xbc,
+	0x31, 0xcf, 0x0a, 0xd3, 0xea, 0xa9, 0x71, 0xcd, 0xcb, 0xa0, 0xaf, 0x1f, 0xee, 0x5d, 0x16, 0xd8,
+	0x36, 0xf1, 0xc9, 0x6a, 0x45, 0x9d, 0xe2, 0x88, 0x14, 0x58, 0x3f, 0x1e, 0x82, 0x56, 0xf6, 0x19,
+	0x2e, 0x83, 0xc8, 0xb3, 0x18, 0xfa, 0x0a, 0xbc, 0xba, 0x99, 0x5d, 0x11, 0x3c, 0x9b, 0x99, 0xe4,
+	0x72, 0x86, 0x6f, 0x35, 0x93, 0xfc, 0x3e, 0xbd, 0x9e, 0xce, 0xfe, 0x98, 0xc2, 0x67, 0xe8, 0x25,
+	0x40, 0xbb, 0xe0, 0xbb, 0x37, 0x50, 0xe2, 0x2e, 0x59, 0xcf, 0x5b, 0x97, 0x5b, 0x6d, 0xfe, 0x79,
+	0x97, 0x5d, 0x50, 0xb8, 0x7c, 0x94, 0x40, 0xf3, 0xe1, 0xef, 0x21, 0x3a, 0x04, 0x2f, 0x32, 0x15,
+	0x19, 0x69, 0xc6, 0x88, 0x18, 0x26, 0xd6, 0x4c, 0xfd, 0xea, 0x3d, 0x7c, 0x86, 0x10, 0x68, 0xe3,
+	0xcb, 0x8b, 0xb3, 0x5f, 0xcf, 0x06, 0xc4, 0x18, 0x69, 0x83, 0xd3, 0x33, 0x28, 0xa1, 0x03, 0xb0,
+	0x67, 0xea, 0x86, 0x49, 0xb8, 0x39, 0xe7, 0xeb, 0x18, 0x96, 0xb8, 0xc7, 0xec, 0x7c, 0xa2, 0x5f,
+	0x98, 0x64, 0x87, 0x5f, 0x46, 0x2f, 0xc0, 0xfe, 0xc5, 0x6c, 0x3a, 0xbe, 0x36, 0x78, 0xea, 0xf4,
+	0xcd, 0x80, 0xf0, 0xb4, 0x8c, 0xf6, 0x41, 0x6b, 0x9b, 0xe6, 0xa9, 0xca, 0xf1, 0x3f, 0x12, 0xa8,
+	0x17, 0x2f, 0x02, 0xef, 0x3f, 0x6f, 0xcb, 0xc4, 0xba, 0x4e, 0x0c, 0x53, 0x33, 0x75, 0xf8, 0x0c,
+	0x01, 0x50, 0xd5, 0x2e, 0xcc, 0xf1, 0x3b, 0x1d, 0x4a, 0x7c, 0x7d, 0x89, 0x67, 0x77, 0xfa, 0x14,
+	0x96, 0xd0, 0x6b, 0xf0, 0x6a, 0xa8, 0xcf, 0xb1, 0x7e, 0xa1, 0x99, 0xfa, 0x90, 0x18, 0xb3, 0x4b,
+	0x93, 0x0c, 0xf5, 0x1b, 0xdd, 0xd4, 0x87, 0xb0, 0xdc, 0x29, 0x29, 0xd2, 0x0e, 0x61, 0xa4, 0xe1,
+	0x61, 0x41, 0x90, 0x05, 0xa1, 0x09, 0x94, 0x21, 0xd6, 0xc6, 0xd3, 0xf1, 0xf4, 0x0a, 0x56, 0x8e,
+	0xaf, 0x80, 0x92, 0xbf, 0x35, 0x7c, 0x0f, 0x8f, 0x7a, 0x31, 0xdf, 0xcf, 0x79, 0x2b, 0x35, 0x50,
+	0xbe, 0x99, 0x5d, 0x41, 0x89, 0x2f, 0x6e, 0xb5, 0x39, 0x2c, 0xf1, 0x0f, 0x36, 0xc7, 0xfa, 0x0c,
+	0x0f, 0x75, 0xac, 0x0f, 0x09, 0x07, 0xcb, 0xe7, 0x23, 0x70, 0xb8, 0x0c, 0xbc, 0xfc, 0x7a, 0x3f,
+	0x7e, 0xde, 0xcf, 0x5b, 0x66, 0x16, 0xcf, 0x79, 0x38, 0x97, 0xee, 0x3a, 0xb6, 0xc3, 0xd6, 0x9b,
+	0x45, 0x7f, 0x19, 0x78, 0x27, 0xd9, 0xfb, 0x9b, 0x4b, 0x16, 0x55, 0xa1, 0xf9, 0xf9, 0xbf, 0x00,
+	0x00, 0x00, 0xff, 0xff, 0x7f, 0x1e, 0xf7, 0xb2, 0x24, 0x08, 0x00, 0x00,
 }

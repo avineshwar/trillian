@@ -3,14 +3,15 @@
 
 package trillian
 
-import proto "github.com/golang/protobuf/proto"
-import fmt "fmt"
-import math "math"
-import _ "google.golang.org/genproto/googleapis/api/annotations"
-
 import (
-	context "golang.org/x/net/context"
+	context "context"
+	fmt "fmt"
+	proto "github.com/golang/protobuf/proto"
+	_ "google.golang.org/genproto/googleapis/api/annotations"
 	grpc "google.golang.org/grpc"
+	codes "google.golang.org/grpc/codes"
+	status "google.golang.org/grpc/status"
+	math "math"
 )
 
 // Reference imports to suppress errors if they are not otherwise used.
@@ -18,23 +19,63 @@ var _ = proto.Marshal
 var _ = fmt.Errorf
 var _ = math.Inf
 
+// This is a compile-time assertion to ensure that this generated file
+// is compatible with the proto package it is being compiled against.
+// A compilation error at this line likely means your copy of the
+// proto package needs to be updated.
+const _ = proto.ProtoPackageIsVersion3 // please upgrade the proto package
+
 // MapLeaf represents the data behind Map leaves.
 type MapLeaf struct {
 	// index is the location of this leaf.
 	// All indexes for a given Map must contain a constant number of bits.
+	// These are not numeric indices. Note that this is typically derived using a
+	// hash and thus the length of all indices in the map will match the number
+	// of bits in the hash function.
 	Index []byte `protobuf:"bytes,1,opt,name=index,proto3" json:"index,omitempty"`
-	// leaf_hash is the tree hash of leaf_value.
+	// leaf_hash is the tree hash of leaf_value.  This does not need to be set
+	// on SetMapLeavesRequest; the server will fill it in.
+	// For an empty leaf (len(leaf_value)==0), there may be two possible values
+	// for this hash:
+	//  - If the leaf has never been set, it counts as an empty subtree and
+	//    a nil value is used.
+	//  - If the leaf has been explicitly set to a zero-length entry, it no
+	//    longer counts as empty and the value of hasher.HashLeaf(index, nil)
+	//    will be used.
 	LeafHash []byte `protobuf:"bytes,2,opt,name=leaf_hash,json=leafHash,proto3" json:"leaf_hash,omitempty"`
 	// leaf_value is the data the tree commits to.
 	LeafValue []byte `protobuf:"bytes,3,opt,name=leaf_value,json=leafValue,proto3" json:"leaf_value,omitempty"`
 	// extra_data holds related contextual data, but is not covered by any hash.
-	ExtraData []byte `protobuf:"bytes,4,opt,name=extra_data,json=extraData,proto3" json:"extra_data,omitempty"`
+	ExtraData            []byte   `protobuf:"bytes,4,opt,name=extra_data,json=extraData,proto3" json:"extra_data,omitempty"`
+	XXX_NoUnkeyedLiteral struct{} `json:"-"`
+	XXX_unrecognized     []byte   `json:"-"`
+	XXX_sizecache        int32    `json:"-"`
 }
 
-func (m *MapLeaf) Reset()                    { *m = MapLeaf{} }
-func (m *MapLeaf) String() string            { return proto.CompactTextString(m) }
-func (*MapLeaf) ProtoMessage()               {}
-func (*MapLeaf) Descriptor() ([]byte, []int) { return fileDescriptor1, []int{0} }
+func (m *MapLeaf) Reset()         { *m = MapLeaf{} }
+func (m *MapLeaf) String() string { return proto.CompactTextString(m) }
+func (*MapLeaf) ProtoMessage()    {}
+func (*MapLeaf) Descriptor() ([]byte, []int) {
+	return fileDescriptor_28d34dfba22a7ce2, []int{0}
+}
+
+func (m *MapLeaf) XXX_Unmarshal(b []byte) error {
+	return xxx_messageInfo_MapLeaf.Unmarshal(m, b)
+}
+func (m *MapLeaf) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	return xxx_messageInfo_MapLeaf.Marshal(b, m, deterministic)
+}
+func (m *MapLeaf) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_MapLeaf.Merge(m, src)
+}
+func (m *MapLeaf) XXX_Size() int {
+	return xxx_messageInfo_MapLeaf.Size(m)
+}
+func (m *MapLeaf) XXX_DiscardUnknown() {
+	xxx_messageInfo_MapLeaf.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_MapLeaf proto.InternalMessageInfo
 
 func (m *MapLeaf) GetIndex() []byte {
 	if m != nil {
@@ -65,14 +106,44 @@ func (m *MapLeaf) GetExtraData() []byte {
 }
 
 type MapLeafInclusion struct {
-	Leaf      *MapLeaf `protobuf:"bytes,1,opt,name=leaf" json:"leaf,omitempty"`
-	Inclusion [][]byte `protobuf:"bytes,2,rep,name=inclusion,proto3" json:"inclusion,omitempty"`
+	Leaf *MapLeaf `protobuf:"bytes,1,opt,name=leaf,proto3" json:"leaf,omitempty"`
+	// inclusion holds the inclusion proof for this leaf in the map root. It
+	// holds one entry for each level of the tree; combining each of these in
+	// turn with the leaf's hash (according to the tree's hash strategy)
+	// reproduces the root hash.  A nil entry for a particular level indicates
+	// that the node in question has an empty subtree beneath it (and so its
+	// associated hash value is hasher.HashEmpty(index, height) rather than
+	// hasher.HashChildren(l_hash, r_hash)).
+	Inclusion            [][]byte `protobuf:"bytes,2,rep,name=inclusion,proto3" json:"inclusion,omitempty"`
+	XXX_NoUnkeyedLiteral struct{} `json:"-"`
+	XXX_unrecognized     []byte   `json:"-"`
+	XXX_sizecache        int32    `json:"-"`
 }
 
-func (m *MapLeafInclusion) Reset()                    { *m = MapLeafInclusion{} }
-func (m *MapLeafInclusion) String() string            { return proto.CompactTextString(m) }
-func (*MapLeafInclusion) ProtoMessage()               {}
-func (*MapLeafInclusion) Descriptor() ([]byte, []int) { return fileDescriptor1, []int{1} }
+func (m *MapLeafInclusion) Reset()         { *m = MapLeafInclusion{} }
+func (m *MapLeafInclusion) String() string { return proto.CompactTextString(m) }
+func (*MapLeafInclusion) ProtoMessage()    {}
+func (*MapLeafInclusion) Descriptor() ([]byte, []int) {
+	return fileDescriptor_28d34dfba22a7ce2, []int{1}
+}
+
+func (m *MapLeafInclusion) XXX_Unmarshal(b []byte) error {
+	return xxx_messageInfo_MapLeafInclusion.Unmarshal(m, b)
+}
+func (m *MapLeafInclusion) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	return xxx_messageInfo_MapLeafInclusion.Marshal(b, m, deterministic)
+}
+func (m *MapLeafInclusion) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_MapLeafInclusion.Merge(m, src)
+}
+func (m *MapLeafInclusion) XXX_Size() int {
+	return xxx_messageInfo_MapLeafInclusion.Size(m)
+}
+func (m *MapLeafInclusion) XXX_DiscardUnknown() {
+	xxx_messageInfo_MapLeafInclusion.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_MapLeafInclusion proto.InternalMessageInfo
 
 func (m *MapLeafInclusion) GetLeaf() *MapLeaf {
 	if m != nil {
@@ -89,15 +160,37 @@ func (m *MapLeafInclusion) GetInclusion() [][]byte {
 }
 
 type GetMapLeavesRequest struct {
-	MapId    int64    `protobuf:"varint,1,opt,name=map_id,json=mapId" json:"map_id,omitempty"`
-	Index    [][]byte `protobuf:"bytes,2,rep,name=index,proto3" json:"index,omitempty"`
-	Revision int64    `protobuf:"varint,3,opt,name=revision" json:"revision,omitempty"`
+	MapId                int64    `protobuf:"varint,1,opt,name=map_id,json=mapId,proto3" json:"map_id,omitempty"`
+	Index                [][]byte `protobuf:"bytes,2,rep,name=index,proto3" json:"index,omitempty"`
+	XXX_NoUnkeyedLiteral struct{} `json:"-"`
+	XXX_unrecognized     []byte   `json:"-"`
+	XXX_sizecache        int32    `json:"-"`
 }
 
-func (m *GetMapLeavesRequest) Reset()                    { *m = GetMapLeavesRequest{} }
-func (m *GetMapLeavesRequest) String() string            { return proto.CompactTextString(m) }
-func (*GetMapLeavesRequest) ProtoMessage()               {}
-func (*GetMapLeavesRequest) Descriptor() ([]byte, []int) { return fileDescriptor1, []int{2} }
+func (m *GetMapLeavesRequest) Reset()         { *m = GetMapLeavesRequest{} }
+func (m *GetMapLeavesRequest) String() string { return proto.CompactTextString(m) }
+func (*GetMapLeavesRequest) ProtoMessage()    {}
+func (*GetMapLeavesRequest) Descriptor() ([]byte, []int) {
+	return fileDescriptor_28d34dfba22a7ce2, []int{2}
+}
+
+func (m *GetMapLeavesRequest) XXX_Unmarshal(b []byte) error {
+	return xxx_messageInfo_GetMapLeavesRequest.Unmarshal(m, b)
+}
+func (m *GetMapLeavesRequest) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	return xxx_messageInfo_GetMapLeavesRequest.Marshal(b, m, deterministic)
+}
+func (m *GetMapLeavesRequest) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_GetMapLeavesRequest.Merge(m, src)
+}
+func (m *GetMapLeavesRequest) XXX_Size() int {
+	return xxx_messageInfo_GetMapLeavesRequest.Size(m)
+}
+func (m *GetMapLeavesRequest) XXX_DiscardUnknown() {
+	xxx_messageInfo_GetMapLeavesRequest.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_GetMapLeavesRequest proto.InternalMessageInfo
 
 func (m *GetMapLeavesRequest) GetMapId() int64 {
 	if m != nil {
@@ -113,22 +206,245 @@ func (m *GetMapLeavesRequest) GetIndex() [][]byte {
 	return nil
 }
 
-func (m *GetMapLeavesRequest) GetRevision() int64 {
+type GetMapLeafRequest struct {
+	MapId                int64    `protobuf:"varint,1,opt,name=map_id,json=mapId,proto3" json:"map_id,omitempty"`
+	Index                []byte   `protobuf:"bytes,2,opt,name=index,proto3" json:"index,omitempty"`
+	XXX_NoUnkeyedLiteral struct{} `json:"-"`
+	XXX_unrecognized     []byte   `json:"-"`
+	XXX_sizecache        int32    `json:"-"`
+}
+
+func (m *GetMapLeafRequest) Reset()         { *m = GetMapLeafRequest{} }
+func (m *GetMapLeafRequest) String() string { return proto.CompactTextString(m) }
+func (*GetMapLeafRequest) ProtoMessage()    {}
+func (*GetMapLeafRequest) Descriptor() ([]byte, []int) {
+	return fileDescriptor_28d34dfba22a7ce2, []int{3}
+}
+
+func (m *GetMapLeafRequest) XXX_Unmarshal(b []byte) error {
+	return xxx_messageInfo_GetMapLeafRequest.Unmarshal(m, b)
+}
+func (m *GetMapLeafRequest) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	return xxx_messageInfo_GetMapLeafRequest.Marshal(b, m, deterministic)
+}
+func (m *GetMapLeafRequest) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_GetMapLeafRequest.Merge(m, src)
+}
+func (m *GetMapLeafRequest) XXX_Size() int {
+	return xxx_messageInfo_GetMapLeafRequest.Size(m)
+}
+func (m *GetMapLeafRequest) XXX_DiscardUnknown() {
+	xxx_messageInfo_GetMapLeafRequest.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_GetMapLeafRequest proto.InternalMessageInfo
+
+func (m *GetMapLeafRequest) GetMapId() int64 {
+	if m != nil {
+		return m.MapId
+	}
+	return 0
+}
+
+func (m *GetMapLeafRequest) GetIndex() []byte {
+	if m != nil {
+		return m.Index
+	}
+	return nil
+}
+
+type GetMapLeafByRevisionRequest struct {
+	MapId                int64    `protobuf:"varint,1,opt,name=map_id,json=mapId,proto3" json:"map_id,omitempty"`
+	Index                []byte   `protobuf:"bytes,2,opt,name=index,proto3" json:"index,omitempty"`
+	Revision             int64    `protobuf:"varint,3,opt,name=revision,proto3" json:"revision,omitempty"`
+	XXX_NoUnkeyedLiteral struct{} `json:"-"`
+	XXX_unrecognized     []byte   `json:"-"`
+	XXX_sizecache        int32    `json:"-"`
+}
+
+func (m *GetMapLeafByRevisionRequest) Reset()         { *m = GetMapLeafByRevisionRequest{} }
+func (m *GetMapLeafByRevisionRequest) String() string { return proto.CompactTextString(m) }
+func (*GetMapLeafByRevisionRequest) ProtoMessage()    {}
+func (*GetMapLeafByRevisionRequest) Descriptor() ([]byte, []int) {
+	return fileDescriptor_28d34dfba22a7ce2, []int{4}
+}
+
+func (m *GetMapLeafByRevisionRequest) XXX_Unmarshal(b []byte) error {
+	return xxx_messageInfo_GetMapLeafByRevisionRequest.Unmarshal(m, b)
+}
+func (m *GetMapLeafByRevisionRequest) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	return xxx_messageInfo_GetMapLeafByRevisionRequest.Marshal(b, m, deterministic)
+}
+func (m *GetMapLeafByRevisionRequest) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_GetMapLeafByRevisionRequest.Merge(m, src)
+}
+func (m *GetMapLeafByRevisionRequest) XXX_Size() int {
+	return xxx_messageInfo_GetMapLeafByRevisionRequest.Size(m)
+}
+func (m *GetMapLeafByRevisionRequest) XXX_DiscardUnknown() {
+	xxx_messageInfo_GetMapLeafByRevisionRequest.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_GetMapLeafByRevisionRequest proto.InternalMessageInfo
+
+func (m *GetMapLeafByRevisionRequest) GetMapId() int64 {
+	if m != nil {
+		return m.MapId
+	}
+	return 0
+}
+
+func (m *GetMapLeafByRevisionRequest) GetIndex() []byte {
+	if m != nil {
+		return m.Index
+	}
+	return nil
+}
+
+func (m *GetMapLeafByRevisionRequest) GetRevision() int64 {
 	if m != nil {
 		return m.Revision
 	}
 	return 0
 }
 
-type GetMapLeavesResponse struct {
-	MapLeafInclusion []*MapLeafInclusion `protobuf:"bytes,2,rep,name=map_leaf_inclusion,json=mapLeafInclusion" json:"map_leaf_inclusion,omitempty"`
-	MapRoot          *SignedMapRoot      `protobuf:"bytes,3,opt,name=map_root,json=mapRoot" json:"map_root,omitempty"`
+// This message replaces the current implementation of GetMapLeavesRequest
+// with the difference that revision must be >=0.
+type GetMapLeavesByRevisionRequest struct {
+	MapId int64    `protobuf:"varint,1,opt,name=map_id,json=mapId,proto3" json:"map_id,omitempty"`
+	Index [][]byte `protobuf:"bytes,2,rep,name=index,proto3" json:"index,omitempty"`
+	// revision >= 0.
+	Revision             int64    `protobuf:"varint,3,opt,name=revision,proto3" json:"revision,omitempty"`
+	XXX_NoUnkeyedLiteral struct{} `json:"-"`
+	XXX_unrecognized     []byte   `json:"-"`
+	XXX_sizecache        int32    `json:"-"`
 }
 
-func (m *GetMapLeavesResponse) Reset()                    { *m = GetMapLeavesResponse{} }
-func (m *GetMapLeavesResponse) String() string            { return proto.CompactTextString(m) }
-func (*GetMapLeavesResponse) ProtoMessage()               {}
-func (*GetMapLeavesResponse) Descriptor() ([]byte, []int) { return fileDescriptor1, []int{3} }
+func (m *GetMapLeavesByRevisionRequest) Reset()         { *m = GetMapLeavesByRevisionRequest{} }
+func (m *GetMapLeavesByRevisionRequest) String() string { return proto.CompactTextString(m) }
+func (*GetMapLeavesByRevisionRequest) ProtoMessage()    {}
+func (*GetMapLeavesByRevisionRequest) Descriptor() ([]byte, []int) {
+	return fileDescriptor_28d34dfba22a7ce2, []int{5}
+}
+
+func (m *GetMapLeavesByRevisionRequest) XXX_Unmarshal(b []byte) error {
+	return xxx_messageInfo_GetMapLeavesByRevisionRequest.Unmarshal(m, b)
+}
+func (m *GetMapLeavesByRevisionRequest) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	return xxx_messageInfo_GetMapLeavesByRevisionRequest.Marshal(b, m, deterministic)
+}
+func (m *GetMapLeavesByRevisionRequest) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_GetMapLeavesByRevisionRequest.Merge(m, src)
+}
+func (m *GetMapLeavesByRevisionRequest) XXX_Size() int {
+	return xxx_messageInfo_GetMapLeavesByRevisionRequest.Size(m)
+}
+func (m *GetMapLeavesByRevisionRequest) XXX_DiscardUnknown() {
+	xxx_messageInfo_GetMapLeavesByRevisionRequest.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_GetMapLeavesByRevisionRequest proto.InternalMessageInfo
+
+func (m *GetMapLeavesByRevisionRequest) GetMapId() int64 {
+	if m != nil {
+		return m.MapId
+	}
+	return 0
+}
+
+func (m *GetMapLeavesByRevisionRequest) GetIndex() [][]byte {
+	if m != nil {
+		return m.Index
+	}
+	return nil
+}
+
+func (m *GetMapLeavesByRevisionRequest) GetRevision() int64 {
+	if m != nil {
+		return m.Revision
+	}
+	return 0
+}
+
+type GetMapLeafResponse struct {
+	MapLeafInclusion     *MapLeafInclusion `protobuf:"bytes,1,opt,name=map_leaf_inclusion,json=mapLeafInclusion,proto3" json:"map_leaf_inclusion,omitempty"`
+	MapRoot              *SignedMapRoot    `protobuf:"bytes,2,opt,name=map_root,json=mapRoot,proto3" json:"map_root,omitempty"`
+	XXX_NoUnkeyedLiteral struct{}          `json:"-"`
+	XXX_unrecognized     []byte            `json:"-"`
+	XXX_sizecache        int32             `json:"-"`
+}
+
+func (m *GetMapLeafResponse) Reset()         { *m = GetMapLeafResponse{} }
+func (m *GetMapLeafResponse) String() string { return proto.CompactTextString(m) }
+func (*GetMapLeafResponse) ProtoMessage()    {}
+func (*GetMapLeafResponse) Descriptor() ([]byte, []int) {
+	return fileDescriptor_28d34dfba22a7ce2, []int{6}
+}
+
+func (m *GetMapLeafResponse) XXX_Unmarshal(b []byte) error {
+	return xxx_messageInfo_GetMapLeafResponse.Unmarshal(m, b)
+}
+func (m *GetMapLeafResponse) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	return xxx_messageInfo_GetMapLeafResponse.Marshal(b, m, deterministic)
+}
+func (m *GetMapLeafResponse) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_GetMapLeafResponse.Merge(m, src)
+}
+func (m *GetMapLeafResponse) XXX_Size() int {
+	return xxx_messageInfo_GetMapLeafResponse.Size(m)
+}
+func (m *GetMapLeafResponse) XXX_DiscardUnknown() {
+	xxx_messageInfo_GetMapLeafResponse.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_GetMapLeafResponse proto.InternalMessageInfo
+
+func (m *GetMapLeafResponse) GetMapLeafInclusion() *MapLeafInclusion {
+	if m != nil {
+		return m.MapLeafInclusion
+	}
+	return nil
+}
+
+func (m *GetMapLeafResponse) GetMapRoot() *SignedMapRoot {
+	if m != nil {
+		return m.MapRoot
+	}
+	return nil
+}
+
+type GetMapLeavesResponse struct {
+	MapLeafInclusion     []*MapLeafInclusion `protobuf:"bytes,2,rep,name=map_leaf_inclusion,json=mapLeafInclusion,proto3" json:"map_leaf_inclusion,omitempty"`
+	MapRoot              *SignedMapRoot      `protobuf:"bytes,3,opt,name=map_root,json=mapRoot,proto3" json:"map_root,omitempty"`
+	XXX_NoUnkeyedLiteral struct{}            `json:"-"`
+	XXX_unrecognized     []byte              `json:"-"`
+	XXX_sizecache        int32               `json:"-"`
+}
+
+func (m *GetMapLeavesResponse) Reset()         { *m = GetMapLeavesResponse{} }
+func (m *GetMapLeavesResponse) String() string { return proto.CompactTextString(m) }
+func (*GetMapLeavesResponse) ProtoMessage()    {}
+func (*GetMapLeavesResponse) Descriptor() ([]byte, []int) {
+	return fileDescriptor_28d34dfba22a7ce2, []int{7}
+}
+
+func (m *GetMapLeavesResponse) XXX_Unmarshal(b []byte) error {
+	return xxx_messageInfo_GetMapLeavesResponse.Unmarshal(m, b)
+}
+func (m *GetMapLeavesResponse) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	return xxx_messageInfo_GetMapLeavesResponse.Marshal(b, m, deterministic)
+}
+func (m *GetMapLeavesResponse) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_GetMapLeavesResponse.Merge(m, src)
+}
+func (m *GetMapLeavesResponse) XXX_Size() int {
+	return xxx_messageInfo_GetMapLeavesResponse.Size(m)
+}
+func (m *GetMapLeavesResponse) XXX_DiscardUnknown() {
+	xxx_messageInfo_GetMapLeavesResponse.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_GetMapLeavesResponse proto.InternalMessageInfo
 
 func (m *GetMapLeavesResponse) GetMapLeafInclusion() []*MapLeafInclusion {
 	if m != nil {
@@ -144,16 +460,114 @@ func (m *GetMapLeavesResponse) GetMapRoot() *SignedMapRoot {
 	return nil
 }
 
-type SetMapLeavesRequest struct {
-	MapId      int64           `protobuf:"varint,1,opt,name=map_id,json=mapId" json:"map_id,omitempty"`
-	Leaves     []*MapLeaf      `protobuf:"bytes,2,rep,name=leaves" json:"leaves,omitempty"`
-	MapperData *MapperMetadata `protobuf:"bytes,3,opt,name=mapper_data,json=mapperData" json:"mapper_data,omitempty"`
+// GetLastInRangeByRevisionRequest specifies a range in the map at a revision.
+// The range is defined as the entire subtree below a particular point in the
+// Merkle tree. Another way of saying this is that the range matches all leaves
+// that share a common prefix of `prefix_bits` with `prefix`.
+type GetLastInRangeByRevisionRequest struct {
+	MapId    int64  `protobuf:"varint,1,opt,name=map_id,json=mapId,proto3" json:"map_id,omitempty"`
+	Revision int64  `protobuf:"varint,2,opt,name=revision,proto3" json:"revision,omitempty"`
+	Prefix   []byte `protobuf:"bytes,3,opt,name=prefix,proto3" json:"prefix,omitempty"`
+	// prefix_bits is the number of bits to include, starting from the left, or
+	// most significant bit (MSB).
+	PrefixBits           int32    `protobuf:"varint,4,opt,name=prefix_bits,json=prefixBits,proto3" json:"prefix_bits,omitempty"`
+	XXX_NoUnkeyedLiteral struct{} `json:"-"`
+	XXX_unrecognized     []byte   `json:"-"`
+	XXX_sizecache        int32    `json:"-"`
 }
 
-func (m *SetMapLeavesRequest) Reset()                    { *m = SetMapLeavesRequest{} }
-func (m *SetMapLeavesRequest) String() string            { return proto.CompactTextString(m) }
-func (*SetMapLeavesRequest) ProtoMessage()               {}
-func (*SetMapLeavesRequest) Descriptor() ([]byte, []int) { return fileDescriptor1, []int{4} }
+func (m *GetLastInRangeByRevisionRequest) Reset()         { *m = GetLastInRangeByRevisionRequest{} }
+func (m *GetLastInRangeByRevisionRequest) String() string { return proto.CompactTextString(m) }
+func (*GetLastInRangeByRevisionRequest) ProtoMessage()    {}
+func (*GetLastInRangeByRevisionRequest) Descriptor() ([]byte, []int) {
+	return fileDescriptor_28d34dfba22a7ce2, []int{8}
+}
+
+func (m *GetLastInRangeByRevisionRequest) XXX_Unmarshal(b []byte) error {
+	return xxx_messageInfo_GetLastInRangeByRevisionRequest.Unmarshal(m, b)
+}
+func (m *GetLastInRangeByRevisionRequest) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	return xxx_messageInfo_GetLastInRangeByRevisionRequest.Marshal(b, m, deterministic)
+}
+func (m *GetLastInRangeByRevisionRequest) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_GetLastInRangeByRevisionRequest.Merge(m, src)
+}
+func (m *GetLastInRangeByRevisionRequest) XXX_Size() int {
+	return xxx_messageInfo_GetLastInRangeByRevisionRequest.Size(m)
+}
+func (m *GetLastInRangeByRevisionRequest) XXX_DiscardUnknown() {
+	xxx_messageInfo_GetLastInRangeByRevisionRequest.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_GetLastInRangeByRevisionRequest proto.InternalMessageInfo
+
+func (m *GetLastInRangeByRevisionRequest) GetMapId() int64 {
+	if m != nil {
+		return m.MapId
+	}
+	return 0
+}
+
+func (m *GetLastInRangeByRevisionRequest) GetRevision() int64 {
+	if m != nil {
+		return m.Revision
+	}
+	return 0
+}
+
+func (m *GetLastInRangeByRevisionRequest) GetPrefix() []byte {
+	if m != nil {
+		return m.Prefix
+	}
+	return nil
+}
+
+func (m *GetLastInRangeByRevisionRequest) GetPrefixBits() int32 {
+	if m != nil {
+		return m.PrefixBits
+	}
+	return 0
+}
+
+type SetMapLeavesRequest struct {
+	MapId int64 `protobuf:"varint,1,opt,name=map_id,json=mapId,proto3" json:"map_id,omitempty"`
+	// The leaves being set must have unique Index values within the request.
+	Leaves   []*MapLeaf `protobuf:"bytes,2,rep,name=leaves,proto3" json:"leaves,omitempty"`
+	Metadata []byte     `protobuf:"bytes,5,opt,name=metadata,proto3" json:"metadata,omitempty"`
+	// The map revision to associate the leaves with. The request will fail if
+	// this revision already exists, does not match the current write revision, or
+	// is negative. If revision = 0 then the leaves will be written to the current
+	// write revision.
+	Revision             int64    `protobuf:"varint,6,opt,name=revision,proto3" json:"revision,omitempty"`
+	XXX_NoUnkeyedLiteral struct{} `json:"-"`
+	XXX_unrecognized     []byte   `json:"-"`
+	XXX_sizecache        int32    `json:"-"`
+}
+
+func (m *SetMapLeavesRequest) Reset()         { *m = SetMapLeavesRequest{} }
+func (m *SetMapLeavesRequest) String() string { return proto.CompactTextString(m) }
+func (*SetMapLeavesRequest) ProtoMessage()    {}
+func (*SetMapLeavesRequest) Descriptor() ([]byte, []int) {
+	return fileDescriptor_28d34dfba22a7ce2, []int{9}
+}
+
+func (m *SetMapLeavesRequest) XXX_Unmarshal(b []byte) error {
+	return xxx_messageInfo_SetMapLeavesRequest.Unmarshal(m, b)
+}
+func (m *SetMapLeavesRequest) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	return xxx_messageInfo_SetMapLeavesRequest.Marshal(b, m, deterministic)
+}
+func (m *SetMapLeavesRequest) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_SetMapLeavesRequest.Merge(m, src)
+}
+func (m *SetMapLeavesRequest) XXX_Size() int {
+	return xxx_messageInfo_SetMapLeavesRequest.Size(m)
+}
+func (m *SetMapLeavesRequest) XXX_DiscardUnknown() {
+	xxx_messageInfo_SetMapLeavesRequest.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_SetMapLeavesRequest proto.InternalMessageInfo
 
 func (m *SetMapLeavesRequest) GetMapId() int64 {
 	if m != nil {
@@ -169,21 +583,51 @@ func (m *SetMapLeavesRequest) GetLeaves() []*MapLeaf {
 	return nil
 }
 
-func (m *SetMapLeavesRequest) GetMapperData() *MapperMetadata {
+func (m *SetMapLeavesRequest) GetMetadata() []byte {
 	if m != nil {
-		return m.MapperData
+		return m.Metadata
 	}
 	return nil
 }
 
-type SetMapLeavesResponse struct {
-	MapRoot *SignedMapRoot `protobuf:"bytes,2,opt,name=map_root,json=mapRoot" json:"map_root,omitempty"`
+func (m *SetMapLeavesRequest) GetRevision() int64 {
+	if m != nil {
+		return m.Revision
+	}
+	return 0
 }
 
-func (m *SetMapLeavesResponse) Reset()                    { *m = SetMapLeavesResponse{} }
-func (m *SetMapLeavesResponse) String() string            { return proto.CompactTextString(m) }
-func (*SetMapLeavesResponse) ProtoMessage()               {}
-func (*SetMapLeavesResponse) Descriptor() ([]byte, []int) { return fileDescriptor1, []int{5} }
+type SetMapLeavesResponse struct {
+	MapRoot              *SignedMapRoot `protobuf:"bytes,2,opt,name=map_root,json=mapRoot,proto3" json:"map_root,omitempty"`
+	XXX_NoUnkeyedLiteral struct{}       `json:"-"`
+	XXX_unrecognized     []byte         `json:"-"`
+	XXX_sizecache        int32          `json:"-"`
+}
+
+func (m *SetMapLeavesResponse) Reset()         { *m = SetMapLeavesResponse{} }
+func (m *SetMapLeavesResponse) String() string { return proto.CompactTextString(m) }
+func (*SetMapLeavesResponse) ProtoMessage()    {}
+func (*SetMapLeavesResponse) Descriptor() ([]byte, []int) {
+	return fileDescriptor_28d34dfba22a7ce2, []int{10}
+}
+
+func (m *SetMapLeavesResponse) XXX_Unmarshal(b []byte) error {
+	return xxx_messageInfo_SetMapLeavesResponse.Unmarshal(m, b)
+}
+func (m *SetMapLeavesResponse) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	return xxx_messageInfo_SetMapLeavesResponse.Marshal(b, m, deterministic)
+}
+func (m *SetMapLeavesResponse) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_SetMapLeavesResponse.Merge(m, src)
+}
+func (m *SetMapLeavesResponse) XXX_Size() int {
+	return xxx_messageInfo_SetMapLeavesResponse.Size(m)
+}
+func (m *SetMapLeavesResponse) XXX_DiscardUnknown() {
+	xxx_messageInfo_SetMapLeavesResponse.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_SetMapLeavesResponse proto.InternalMessageInfo
 
 func (m *SetMapLeavesResponse) GetMapRoot() *SignedMapRoot {
 	if m != nil {
@@ -193,13 +637,36 @@ func (m *SetMapLeavesResponse) GetMapRoot() *SignedMapRoot {
 }
 
 type GetSignedMapRootRequest struct {
-	MapId int64 `protobuf:"varint,1,opt,name=map_id,json=mapId" json:"map_id,omitempty"`
+	MapId                int64    `protobuf:"varint,1,opt,name=map_id,json=mapId,proto3" json:"map_id,omitempty"`
+	XXX_NoUnkeyedLiteral struct{} `json:"-"`
+	XXX_unrecognized     []byte   `json:"-"`
+	XXX_sizecache        int32    `json:"-"`
 }
 
-func (m *GetSignedMapRootRequest) Reset()                    { *m = GetSignedMapRootRequest{} }
-func (m *GetSignedMapRootRequest) String() string            { return proto.CompactTextString(m) }
-func (*GetSignedMapRootRequest) ProtoMessage()               {}
-func (*GetSignedMapRootRequest) Descriptor() ([]byte, []int) { return fileDescriptor1, []int{6} }
+func (m *GetSignedMapRootRequest) Reset()         { *m = GetSignedMapRootRequest{} }
+func (m *GetSignedMapRootRequest) String() string { return proto.CompactTextString(m) }
+func (*GetSignedMapRootRequest) ProtoMessage()    {}
+func (*GetSignedMapRootRequest) Descriptor() ([]byte, []int) {
+	return fileDescriptor_28d34dfba22a7ce2, []int{11}
+}
+
+func (m *GetSignedMapRootRequest) XXX_Unmarshal(b []byte) error {
+	return xxx_messageInfo_GetSignedMapRootRequest.Unmarshal(m, b)
+}
+func (m *GetSignedMapRootRequest) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	return xxx_messageInfo_GetSignedMapRootRequest.Marshal(b, m, deterministic)
+}
+func (m *GetSignedMapRootRequest) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_GetSignedMapRootRequest.Merge(m, src)
+}
+func (m *GetSignedMapRootRequest) XXX_Size() int {
+	return xxx_messageInfo_GetSignedMapRootRequest.Size(m)
+}
+func (m *GetSignedMapRootRequest) XXX_DiscardUnknown() {
+	xxx_messageInfo_GetSignedMapRootRequest.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_GetSignedMapRootRequest proto.InternalMessageInfo
 
 func (m *GetSignedMapRootRequest) GetMapId() int64 {
 	if m != nil {
@@ -209,16 +676,37 @@ func (m *GetSignedMapRootRequest) GetMapId() int64 {
 }
 
 type GetSignedMapRootByRevisionRequest struct {
-	MapId    int64 `protobuf:"varint,1,opt,name=map_id,json=mapId" json:"map_id,omitempty"`
-	Revision int64 `protobuf:"varint,2,opt,name=revision" json:"revision,omitempty"`
+	MapId                int64    `protobuf:"varint,1,opt,name=map_id,json=mapId,proto3" json:"map_id,omitempty"`
+	Revision             int64    `protobuf:"varint,2,opt,name=revision,proto3" json:"revision,omitempty"`
+	XXX_NoUnkeyedLiteral struct{} `json:"-"`
+	XXX_unrecognized     []byte   `json:"-"`
+	XXX_sizecache        int32    `json:"-"`
 }
 
 func (m *GetSignedMapRootByRevisionRequest) Reset()         { *m = GetSignedMapRootByRevisionRequest{} }
 func (m *GetSignedMapRootByRevisionRequest) String() string { return proto.CompactTextString(m) }
 func (*GetSignedMapRootByRevisionRequest) ProtoMessage()    {}
 func (*GetSignedMapRootByRevisionRequest) Descriptor() ([]byte, []int) {
-	return fileDescriptor1, []int{7}
+	return fileDescriptor_28d34dfba22a7ce2, []int{12}
 }
+
+func (m *GetSignedMapRootByRevisionRequest) XXX_Unmarshal(b []byte) error {
+	return xxx_messageInfo_GetSignedMapRootByRevisionRequest.Unmarshal(m, b)
+}
+func (m *GetSignedMapRootByRevisionRequest) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	return xxx_messageInfo_GetSignedMapRootByRevisionRequest.Marshal(b, m, deterministic)
+}
+func (m *GetSignedMapRootByRevisionRequest) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_GetSignedMapRootByRevisionRequest.Merge(m, src)
+}
+func (m *GetSignedMapRootByRevisionRequest) XXX_Size() int {
+	return xxx_messageInfo_GetSignedMapRootByRevisionRequest.Size(m)
+}
+func (m *GetSignedMapRootByRevisionRequest) XXX_DiscardUnknown() {
+	xxx_messageInfo_GetSignedMapRootByRevisionRequest.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_GetSignedMapRootByRevisionRequest proto.InternalMessageInfo
 
 func (m *GetSignedMapRootByRevisionRequest) GetMapId() int64 {
 	if m != nil {
@@ -235,13 +723,36 @@ func (m *GetSignedMapRootByRevisionRequest) GetRevision() int64 {
 }
 
 type GetSignedMapRootResponse struct {
-	MapRoot *SignedMapRoot `protobuf:"bytes,2,opt,name=map_root,json=mapRoot" json:"map_root,omitempty"`
+	MapRoot              *SignedMapRoot `protobuf:"bytes,2,opt,name=map_root,json=mapRoot,proto3" json:"map_root,omitempty"`
+	XXX_NoUnkeyedLiteral struct{}       `json:"-"`
+	XXX_unrecognized     []byte         `json:"-"`
+	XXX_sizecache        int32          `json:"-"`
 }
 
-func (m *GetSignedMapRootResponse) Reset()                    { *m = GetSignedMapRootResponse{} }
-func (m *GetSignedMapRootResponse) String() string            { return proto.CompactTextString(m) }
-func (*GetSignedMapRootResponse) ProtoMessage()               {}
-func (*GetSignedMapRootResponse) Descriptor() ([]byte, []int) { return fileDescriptor1, []int{8} }
+func (m *GetSignedMapRootResponse) Reset()         { *m = GetSignedMapRootResponse{} }
+func (m *GetSignedMapRootResponse) String() string { return proto.CompactTextString(m) }
+func (*GetSignedMapRootResponse) ProtoMessage()    {}
+func (*GetSignedMapRootResponse) Descriptor() ([]byte, []int) {
+	return fileDescriptor_28d34dfba22a7ce2, []int{13}
+}
+
+func (m *GetSignedMapRootResponse) XXX_Unmarshal(b []byte) error {
+	return xxx_messageInfo_GetSignedMapRootResponse.Unmarshal(m, b)
+}
+func (m *GetSignedMapRootResponse) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	return xxx_messageInfo_GetSignedMapRootResponse.Marshal(b, m, deterministic)
+}
+func (m *GetSignedMapRootResponse) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_GetSignedMapRootResponse.Merge(m, src)
+}
+func (m *GetSignedMapRootResponse) XXX_Size() int {
+	return xxx_messageInfo_GetSignedMapRootResponse.Size(m)
+}
+func (m *GetSignedMapRootResponse) XXX_DiscardUnknown() {
+	xxx_messageInfo_GetSignedMapRootResponse.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_GetSignedMapRootResponse proto.InternalMessageInfo
 
 func (m *GetSignedMapRootResponse) GetMapRoot() *SignedMapRoot {
 	if m != nil {
@@ -250,16 +761,161 @@ func (m *GetSignedMapRootResponse) GetMapRoot() *SignedMapRoot {
 	return nil
 }
 
+type InitMapRequest struct {
+	MapId                int64    `protobuf:"varint,1,opt,name=map_id,json=mapId,proto3" json:"map_id,omitempty"`
+	XXX_NoUnkeyedLiteral struct{} `json:"-"`
+	XXX_unrecognized     []byte   `json:"-"`
+	XXX_sizecache        int32    `json:"-"`
+}
+
+func (m *InitMapRequest) Reset()         { *m = InitMapRequest{} }
+func (m *InitMapRequest) String() string { return proto.CompactTextString(m) }
+func (*InitMapRequest) ProtoMessage()    {}
+func (*InitMapRequest) Descriptor() ([]byte, []int) {
+	return fileDescriptor_28d34dfba22a7ce2, []int{14}
+}
+
+func (m *InitMapRequest) XXX_Unmarshal(b []byte) error {
+	return xxx_messageInfo_InitMapRequest.Unmarshal(m, b)
+}
+func (m *InitMapRequest) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	return xxx_messageInfo_InitMapRequest.Marshal(b, m, deterministic)
+}
+func (m *InitMapRequest) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_InitMapRequest.Merge(m, src)
+}
+func (m *InitMapRequest) XXX_Size() int {
+	return xxx_messageInfo_InitMapRequest.Size(m)
+}
+func (m *InitMapRequest) XXX_DiscardUnknown() {
+	xxx_messageInfo_InitMapRequest.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_InitMapRequest proto.InternalMessageInfo
+
+func (m *InitMapRequest) GetMapId() int64 {
+	if m != nil {
+		return m.MapId
+	}
+	return 0
+}
+
+type InitMapResponse struct {
+	Created              *SignedMapRoot `protobuf:"bytes,1,opt,name=created,proto3" json:"created,omitempty"`
+	XXX_NoUnkeyedLiteral struct{}       `json:"-"`
+	XXX_unrecognized     []byte         `json:"-"`
+	XXX_sizecache        int32          `json:"-"`
+}
+
+func (m *InitMapResponse) Reset()         { *m = InitMapResponse{} }
+func (m *InitMapResponse) String() string { return proto.CompactTextString(m) }
+func (*InitMapResponse) ProtoMessage()    {}
+func (*InitMapResponse) Descriptor() ([]byte, []int) {
+	return fileDescriptor_28d34dfba22a7ce2, []int{15}
+}
+
+func (m *InitMapResponse) XXX_Unmarshal(b []byte) error {
+	return xxx_messageInfo_InitMapResponse.Unmarshal(m, b)
+}
+func (m *InitMapResponse) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	return xxx_messageInfo_InitMapResponse.Marshal(b, m, deterministic)
+}
+func (m *InitMapResponse) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_InitMapResponse.Merge(m, src)
+}
+func (m *InitMapResponse) XXX_Size() int {
+	return xxx_messageInfo_InitMapResponse.Size(m)
+}
+func (m *InitMapResponse) XXX_DiscardUnknown() {
+	xxx_messageInfo_InitMapResponse.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_InitMapResponse proto.InternalMessageInfo
+
+func (m *InitMapResponse) GetCreated() *SignedMapRoot {
+	if m != nil {
+		return m.Created
+	}
+	return nil
+}
+
 func init() {
 	proto.RegisterType((*MapLeaf)(nil), "trillian.MapLeaf")
 	proto.RegisterType((*MapLeafInclusion)(nil), "trillian.MapLeafInclusion")
 	proto.RegisterType((*GetMapLeavesRequest)(nil), "trillian.GetMapLeavesRequest")
+	proto.RegisterType((*GetMapLeafRequest)(nil), "trillian.GetMapLeafRequest")
+	proto.RegisterType((*GetMapLeafByRevisionRequest)(nil), "trillian.GetMapLeafByRevisionRequest")
+	proto.RegisterType((*GetMapLeavesByRevisionRequest)(nil), "trillian.GetMapLeavesByRevisionRequest")
+	proto.RegisterType((*GetMapLeafResponse)(nil), "trillian.GetMapLeafResponse")
 	proto.RegisterType((*GetMapLeavesResponse)(nil), "trillian.GetMapLeavesResponse")
+	proto.RegisterType((*GetLastInRangeByRevisionRequest)(nil), "trillian.GetLastInRangeByRevisionRequest")
 	proto.RegisterType((*SetMapLeavesRequest)(nil), "trillian.SetMapLeavesRequest")
 	proto.RegisterType((*SetMapLeavesResponse)(nil), "trillian.SetMapLeavesResponse")
 	proto.RegisterType((*GetSignedMapRootRequest)(nil), "trillian.GetSignedMapRootRequest")
 	proto.RegisterType((*GetSignedMapRootByRevisionRequest)(nil), "trillian.GetSignedMapRootByRevisionRequest")
 	proto.RegisterType((*GetSignedMapRootResponse)(nil), "trillian.GetSignedMapRootResponse")
+	proto.RegisterType((*InitMapRequest)(nil), "trillian.InitMapRequest")
+	proto.RegisterType((*InitMapResponse)(nil), "trillian.InitMapResponse")
+}
+
+func init() { proto.RegisterFile("trillian_map_api.proto", fileDescriptor_28d34dfba22a7ce2) }
+
+var fileDescriptor_28d34dfba22a7ce2 = []byte{
+	// 855 bytes of a gzipped FileDescriptorProto
+	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xac, 0x56, 0xcf, 0x4f, 0x3b, 0x45,
+	0x14, 0x77, 0xfb, 0x9b, 0x57, 0x83, 0x65, 0x40, 0x28, 0x5b, 0x2a, 0xb0, 0x84, 0x20, 0x21, 0xe9,
+	0x4a, 0xbd, 0x11, 0x63, 0xb4, 0x21, 0x42, 0x09, 0x10, 0xb2, 0x35, 0x98, 0x70, 0xa9, 0xd3, 0x76,
+	0xda, 0x4e, 0xb2, 0xbf, 0xdc, 0x9d, 0x36, 0x28, 0xe1, 0xe2, 0xc1, 0x9b, 0x17, 0xf5, 0x66, 0xc2,
+	0x3f, 0xe5, 0x1f, 0xe0, 0xc5, 0x3f, 0xc4, 0xcc, 0xcc, 0xb6, 0xdb, 0x6d, 0xb7, 0xa5, 0x81, 0xef,
+	0xad, 0xf3, 0x7e, 0x7f, 0xde, 0x7b, 0x9f, 0xd7, 0x85, 0x4d, 0xe6, 0x51, 0xd3, 0xa4, 0xd8, 0x6e,
+	0x5a, 0xd8, 0x6d, 0x62, 0x97, 0x56, 0x5c, 0xcf, 0x61, 0x0e, 0xca, 0x8d, 0xe4, 0xea, 0xea, 0xe8,
+	0x97, 0xd4, 0xa8, 0x3b, 0x3d, 0xc7, 0xe9, 0x99, 0x44, 0xc7, 0x2e, 0xd5, 0xb1, 0x6d, 0x3b, 0x0c,
+	0x33, 0xea, 0xd8, 0xbe, 0xd4, 0x6a, 0xbf, 0x40, 0xf6, 0x06, 0xbb, 0xd7, 0x04, 0x77, 0xd1, 0x06,
+	0xa4, 0xa9, 0xdd, 0x21, 0x8f, 0x45, 0x65, 0x4f, 0xf9, 0xfc, 0x63, 0x43, 0x3e, 0x50, 0x09, 0x56,
+	0x4c, 0x82, 0xbb, 0xcd, 0x3e, 0xf6, 0xfb, 0xc5, 0x84, 0xd0, 0xe4, 0xb8, 0xe0, 0x12, 0xfb, 0x7d,
+	0x54, 0x06, 0x10, 0xca, 0x21, 0x36, 0x07, 0xa4, 0x98, 0x14, 0x5a, 0x61, 0x7e, 0xcf, 0x05, 0x5c,
+	0x4d, 0x1e, 0x99, 0x87, 0x9b, 0x1d, 0xcc, 0x70, 0x31, 0x25, 0xd5, 0x42, 0x72, 0x8e, 0x19, 0xd6,
+	0x7e, 0x80, 0x42, 0x90, 0xbb, 0x6e, 0xb7, 0xcd, 0x81, 0x4f, 0x1d, 0x1b, 0x1d, 0x42, 0x8a, 0xfb,
+	0x8b, 0x1a, 0xf2, 0xd5, 0xb5, 0xca, 0x18, 0x4c, 0x60, 0x69, 0x08, 0x35, 0xda, 0x81, 0x15, 0x3a,
+	0xf2, 0x29, 0x26, 0xf6, 0x92, 0x3c, 0xf0, 0x58, 0xa0, 0x5d, 0xc2, 0xfa, 0x05, 0x61, 0xd2, 0x63,
+	0x48, 0x7c, 0x83, 0xfc, 0x34, 0x20, 0x3e, 0x43, 0x9f, 0x42, 0x86, 0x37, 0x8d, 0x76, 0x44, 0xf4,
+	0xa4, 0x91, 0xb6, 0xb0, 0x5b, 0xef, 0x84, 0xb8, 0x65, 0x1c, 0xf9, 0xb8, 0x4a, 0xe5, 0x92, 0x85,
+	0x94, 0xf6, 0x0d, 0xac, 0x8d, 0x23, 0x75, 0x97, 0x8f, 0x13, 0xf6, 0x4f, 0xeb, 0x42, 0x29, 0x8c,
+	0x50, 0xfb, 0xd9, 0x20, 0x43, 0xca, 0x6b, 0x7c, 0x4b, 0x2c, 0xa4, 0x42, 0xce, 0x0b, 0xfc, 0x45,
+	0xb3, 0x93, 0xc6, 0xf8, 0xad, 0xf5, 0xa1, 0x3c, 0x89, 0xf9, 0x2d, 0x99, 0x92, 0xcb, 0x65, 0xfa,
+	0x43, 0x01, 0x34, 0xd9, 0x14, 0xdf, 0x75, 0x6c, 0x9f, 0xa0, 0x4b, 0x40, 0x3c, 0xbe, 0xd8, 0x87,
+	0x70, 0x36, 0x72, 0x8e, 0xea, 0xcc, 0x1c, 0xc7, 0x13, 0x37, 0x0a, 0xd6, 0xf4, 0x0e, 0x54, 0x21,
+	0xc7, 0x23, 0x79, 0x8e, 0xc3, 0x04, 0xfe, 0x7c, 0x75, 0x2b, 0xf4, 0x6f, 0xd0, 0x9e, 0x4d, 0x3a,
+	0x37, 0xd8, 0x35, 0x1c, 0x87, 0x19, 0x59, 0x4b, 0xfe, 0xd0, 0xfe, 0x52, 0x60, 0x23, 0x3a, 0xf3,
+	0x85, 0x65, 0x71, 0xb0, 0xef, 0x29, 0x2b, 0xb9, 0x64, 0x59, 0xbf, 0x2b, 0xb0, 0x7b, 0x41, 0xd8,
+	0x35, 0xf6, 0x59, 0xdd, 0x36, 0xb0, 0xdd, 0x23, 0x4b, 0x0f, 0x66, 0x72, 0x04, 0x89, 0xe8, 0x08,
+	0xd0, 0x26, 0x64, 0x5c, 0x8f, 0x74, 0xe9, 0x63, 0xc0, 0xb9, 0xe0, 0x85, 0x76, 0x21, 0x2f, 0x7f,
+	0x35, 0x5b, 0x94, 0xf9, 0x82, 0x71, 0x69, 0x03, 0xa4, 0xa8, 0x46, 0x99, 0xaf, 0xfd, 0xad, 0xc0,
+	0x7a, 0x63, 0x79, 0x6a, 0x1c, 0x43, 0xc6, 0x14, 0x76, 0x41, 0xc3, 0x62, 0xf8, 0x18, 0x18, 0xf0,
+	0x72, 0x2d, 0xc2, 0xb0, 0x60, 0x7a, 0x5a, 0x9e, 0x89, 0xd1, 0x3b, 0x02, 0x25, 0x13, 0x85, 0x22,
+	0x79, 0x76, 0x95, 0xca, 0xa5, 0x0a, 0x69, 0xed, 0x0a, 0x36, 0x1a, 0x71, 0x33, 0x7c, 0xcb, 0x42,
+	0x7c, 0x01, 0x5b, 0x17, 0x84, 0x45, 0x95, 0x0b, 0xc1, 0x6a, 0xf7, 0xb0, 0x3f, 0xed, 0xf1, 0x21,
+	0x86, 0xa5, 0xdd, 0x42, 0x71, 0xb6, 0x92, 0x77, 0x20, 0x3b, 0x82, 0xd5, 0xba, 0x4d, 0x79, 0x9b,
+	0x5e, 0x01, 0x74, 0x0e, 0x9f, 0x8c, 0x0d, 0x83, 0x7c, 0xa7, 0x90, 0x6d, 0x7b, 0x04, 0x33, 0xd2,
+	0x09, 0x98, 0x39, 0x3f, 0x5d, 0x60, 0x57, 0xfd, 0x37, 0x0b, 0xf9, 0xef, 0x03, 0x9b, 0x1b, 0xec,
+	0xa2, 0xef, 0x20, 0xcb, 0x37, 0x9a, 0x5f, 0xe1, 0x52, 0xe8, 0x3c, 0x73, 0x25, 0xd5, 0x9d, 0x78,
+	0xa5, 0x2c, 0x44, 0xfb, 0x08, 0x3d, 0x88, 0xd3, 0x1a, 0xbd, 0x8a, 0xe8, 0x30, 0xce, 0x69, 0x66,
+	0x0a, 0xaf, 0xc6, 0xbe, 0x86, 0x15, 0x19, 0x9b, 0x6f, 0x66, 0x39, 0xc6, 0x38, 0x5c, 0x7d, 0xf5,
+	0xb3, 0x79, 0xea, 0x71, 0xb4, 0x1f, 0xc5, 0xdf, 0xc9, 0xf4, 0x5d, 0x45, 0x47, 0xf1, 0x8e, 0xb3,
+	0xd5, 0xbe, 0x9e, 0xe1, 0x45, 0x11, 0x3b, 0x12, 0x7b, 0x26, 0xd0, 0x71, 0xc4, 0x7d, 0xd1, 0x29,
+	0x51, 0x67, 0xf9, 0xa9, 0x9d, 0xff, 0xfa, 0xcf, 0x7f, 0x7f, 0x26, 0xbe, 0x46, 0x5f, 0xe9, 0xc3,
+	0xd3, 0x16, 0x61, 0xf8, 0x54, 0xb7, 0xb0, 0xeb, 0xeb, 0x4f, 0x72, 0x61, 0x9e, 0x75, 0xbe, 0x7a,
+	0xbe, 0xfe, 0x34, 0xda, 0xd6, 0x67, 0x5d, 0xf2, 0xf9, 0xcc, 0xc4, 0x3e, 0x6b, 0x52, 0xbb, 0xe9,
+	0xf1, 0x4c, 0xbc, 0xa1, 0x8d, 0xb8, 0x86, 0x36, 0x16, 0x37, 0xb4, 0x11, 0x0f, 0xf7, 0x37, 0x05,
+	0x0a, 0xd3, 0x94, 0x40, 0xfb, 0x11, 0x98, 0x71, 0xc4, 0x55, 0xb5, 0x45, 0x26, 0x41, 0xf4, 0x13,
+	0x81, 0xf7, 0x10, 0x1d, 0x2c, 0xc2, 0x7b, 0x66, 0x62, 0xc6, 0x89, 0xf3, 0xa2, 0x80, 0x3a, 0x9f,
+	0xf3, 0xe8, 0x64, 0x7e, 0xbe, 0xd9, 0xde, 0x2f, 0x53, 0x9c, 0x2e, 0x8a, 0x3b, 0x46, 0x47, 0x4b,
+	0x0e, 0x03, 0xb5, 0x21, 0x1b, 0x50, 0x18, 0x15, 0xc3, 0xf8, 0x51, 0xfa, 0xab, 0xdb, 0x31, 0x9a,
+	0x20, 0xe1, 0x81, 0x48, 0x58, 0xd6, 0x4a, 0xf1, 0x09, 0xcf, 0xa8, 0x4d, 0x59, 0xed, 0x16, 0xb6,
+	0xdb, 0x8e, 0x55, 0x91, 0xdf, 0x89, 0x95, 0xe8, 0xe7, 0x63, 0x6d, 0x7d, 0x82, 0xfb, 0xdf, 0xba,
+	0xf4, 0x8e, 0x0b, 0xef, 0x94, 0x07, 0xb5, 0x47, 0x59, 0x7f, 0xd0, 0xaa, 0xb4, 0x1d, 0x4b, 0x0f,
+	0x3e, 0x30, 0x47, 0x8e, 0xad, 0x8c, 0xf0, 0xfc, 0xf2, 0xff, 0x00, 0x00, 0x00, 0xff, 0xff, 0xcd,
+	0x2d, 0xf2, 0x14, 0xac, 0x0a, 0x00, 0x00,
 }
 
 // Reference imports to suppress errors if they are not otherwise used.
@@ -270,15 +926,27 @@ var _ grpc.ClientConn
 // is compatible with the grpc package it is being compiled against.
 const _ = grpc.SupportPackageIsVersion4
 
-// Client API for TrillianMap service
-
+// TrillianMapClient is the client API for TrillianMap service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://godoc.org/google.golang.org/grpc#ClientConn.NewStream.
 type TrillianMapClient interface {
 	// GetLeaves returns an inclusion proof for each index requested.
-	// For indexes that do not exist, the inclusion proof will use nil for the empty leaf value.
+	// For indexes that do not exist, the inclusion proof will use nil for the
+	// empty leaf value.
+	GetLeaf(ctx context.Context, in *GetMapLeafRequest, opts ...grpc.CallOption) (*GetMapLeafResponse, error)
+	GetLeafByRevision(ctx context.Context, in *GetMapLeafByRevisionRequest, opts ...grpc.CallOption) (*GetMapLeafResponse, error)
 	GetLeaves(ctx context.Context, in *GetMapLeavesRequest, opts ...grpc.CallOption) (*GetMapLeavesResponse, error)
+	GetLeavesByRevision(ctx context.Context, in *GetMapLeavesByRevisionRequest, opts ...grpc.CallOption) (*GetMapLeavesResponse, error)
+	// GetLastInRangeByRevision returns the last leaf in a requested range.
+	GetLastInRangeByRevision(ctx context.Context, in *GetLastInRangeByRevisionRequest, opts ...grpc.CallOption) (*MapLeaf, error)
+	// SetLeaves sets the values for the provided leaves, and returns the new map
+	// root if successful. Note that if a SetLeaves request fails for a
+	// server-side reason (i.e. not an invalid request), the API user is required
+	// to retry the request before performing a different SetLeaves request.
 	SetLeaves(ctx context.Context, in *SetMapLeavesRequest, opts ...grpc.CallOption) (*SetMapLeavesResponse, error)
 	GetSignedMapRoot(ctx context.Context, in *GetSignedMapRootRequest, opts ...grpc.CallOption) (*GetSignedMapRootResponse, error)
 	GetSignedMapRootByRevision(ctx context.Context, in *GetSignedMapRootByRevisionRequest, opts ...grpc.CallOption) (*GetSignedMapRootResponse, error)
+	InitMap(ctx context.Context, in *InitMapRequest, opts ...grpc.CallOption) (*InitMapResponse, error)
 }
 
 type trillianMapClient struct {
@@ -289,9 +957,45 @@ func NewTrillianMapClient(cc *grpc.ClientConn) TrillianMapClient {
 	return &trillianMapClient{cc}
 }
 
+func (c *trillianMapClient) GetLeaf(ctx context.Context, in *GetMapLeafRequest, opts ...grpc.CallOption) (*GetMapLeafResponse, error) {
+	out := new(GetMapLeafResponse)
+	err := c.cc.Invoke(ctx, "/trillian.TrillianMap/GetLeaf", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *trillianMapClient) GetLeafByRevision(ctx context.Context, in *GetMapLeafByRevisionRequest, opts ...grpc.CallOption) (*GetMapLeafResponse, error) {
+	out := new(GetMapLeafResponse)
+	err := c.cc.Invoke(ctx, "/trillian.TrillianMap/GetLeafByRevision", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *trillianMapClient) GetLeaves(ctx context.Context, in *GetMapLeavesRequest, opts ...grpc.CallOption) (*GetMapLeavesResponse, error) {
 	out := new(GetMapLeavesResponse)
-	err := grpc.Invoke(ctx, "/trillian.TrillianMap/GetLeaves", in, out, c.cc, opts...)
+	err := c.cc.Invoke(ctx, "/trillian.TrillianMap/GetLeaves", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *trillianMapClient) GetLeavesByRevision(ctx context.Context, in *GetMapLeavesByRevisionRequest, opts ...grpc.CallOption) (*GetMapLeavesResponse, error) {
+	out := new(GetMapLeavesResponse)
+	err := c.cc.Invoke(ctx, "/trillian.TrillianMap/GetLeavesByRevision", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *trillianMapClient) GetLastInRangeByRevision(ctx context.Context, in *GetLastInRangeByRevisionRequest, opts ...grpc.CallOption) (*MapLeaf, error) {
+	out := new(MapLeaf)
+	err := c.cc.Invoke(ctx, "/trillian.TrillianMap/GetLastInRangeByRevision", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -300,7 +1004,7 @@ func (c *trillianMapClient) GetLeaves(ctx context.Context, in *GetMapLeavesReque
 
 func (c *trillianMapClient) SetLeaves(ctx context.Context, in *SetMapLeavesRequest, opts ...grpc.CallOption) (*SetMapLeavesResponse, error) {
 	out := new(SetMapLeavesResponse)
-	err := grpc.Invoke(ctx, "/trillian.TrillianMap/SetLeaves", in, out, c.cc, opts...)
+	err := c.cc.Invoke(ctx, "/trillian.TrillianMap/SetLeaves", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -309,7 +1013,7 @@ func (c *trillianMapClient) SetLeaves(ctx context.Context, in *SetMapLeavesReque
 
 func (c *trillianMapClient) GetSignedMapRoot(ctx context.Context, in *GetSignedMapRootRequest, opts ...grpc.CallOption) (*GetSignedMapRootResponse, error) {
 	out := new(GetSignedMapRootResponse)
-	err := grpc.Invoke(ctx, "/trillian.TrillianMap/GetSignedMapRoot", in, out, c.cc, opts...)
+	err := c.cc.Invoke(ctx, "/trillian.TrillianMap/GetSignedMapRoot", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -318,26 +1022,113 @@ func (c *trillianMapClient) GetSignedMapRoot(ctx context.Context, in *GetSignedM
 
 func (c *trillianMapClient) GetSignedMapRootByRevision(ctx context.Context, in *GetSignedMapRootByRevisionRequest, opts ...grpc.CallOption) (*GetSignedMapRootResponse, error) {
 	out := new(GetSignedMapRootResponse)
-	err := grpc.Invoke(ctx, "/trillian.TrillianMap/GetSignedMapRootByRevision", in, out, c.cc, opts...)
+	err := c.cc.Invoke(ctx, "/trillian.TrillianMap/GetSignedMapRootByRevision", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-// Server API for TrillianMap service
+func (c *trillianMapClient) InitMap(ctx context.Context, in *InitMapRequest, opts ...grpc.CallOption) (*InitMapResponse, error) {
+	out := new(InitMapResponse)
+	err := c.cc.Invoke(ctx, "/trillian.TrillianMap/InitMap", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
 
+// TrillianMapServer is the server API for TrillianMap service.
 type TrillianMapServer interface {
 	// GetLeaves returns an inclusion proof for each index requested.
-	// For indexes that do not exist, the inclusion proof will use nil for the empty leaf value.
+	// For indexes that do not exist, the inclusion proof will use nil for the
+	// empty leaf value.
+	GetLeaf(context.Context, *GetMapLeafRequest) (*GetMapLeafResponse, error)
+	GetLeafByRevision(context.Context, *GetMapLeafByRevisionRequest) (*GetMapLeafResponse, error)
 	GetLeaves(context.Context, *GetMapLeavesRequest) (*GetMapLeavesResponse, error)
+	GetLeavesByRevision(context.Context, *GetMapLeavesByRevisionRequest) (*GetMapLeavesResponse, error)
+	// GetLastInRangeByRevision returns the last leaf in a requested range.
+	GetLastInRangeByRevision(context.Context, *GetLastInRangeByRevisionRequest) (*MapLeaf, error)
+	// SetLeaves sets the values for the provided leaves, and returns the new map
+	// root if successful. Note that if a SetLeaves request fails for a
+	// server-side reason (i.e. not an invalid request), the API user is required
+	// to retry the request before performing a different SetLeaves request.
 	SetLeaves(context.Context, *SetMapLeavesRequest) (*SetMapLeavesResponse, error)
 	GetSignedMapRoot(context.Context, *GetSignedMapRootRequest) (*GetSignedMapRootResponse, error)
 	GetSignedMapRootByRevision(context.Context, *GetSignedMapRootByRevisionRequest) (*GetSignedMapRootResponse, error)
+	InitMap(context.Context, *InitMapRequest) (*InitMapResponse, error)
+}
+
+// UnimplementedTrillianMapServer can be embedded to have forward compatible implementations.
+type UnimplementedTrillianMapServer struct {
+}
+
+func (*UnimplementedTrillianMapServer) GetLeaf(ctx context.Context, req *GetMapLeafRequest) (*GetMapLeafResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetLeaf not implemented")
+}
+func (*UnimplementedTrillianMapServer) GetLeafByRevision(ctx context.Context, req *GetMapLeafByRevisionRequest) (*GetMapLeafResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetLeafByRevision not implemented")
+}
+func (*UnimplementedTrillianMapServer) GetLeaves(ctx context.Context, req *GetMapLeavesRequest) (*GetMapLeavesResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetLeaves not implemented")
+}
+func (*UnimplementedTrillianMapServer) GetLeavesByRevision(ctx context.Context, req *GetMapLeavesByRevisionRequest) (*GetMapLeavesResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetLeavesByRevision not implemented")
+}
+func (*UnimplementedTrillianMapServer) GetLastInRangeByRevision(ctx context.Context, req *GetLastInRangeByRevisionRequest) (*MapLeaf, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetLastInRangeByRevision not implemented")
+}
+func (*UnimplementedTrillianMapServer) SetLeaves(ctx context.Context, req *SetMapLeavesRequest) (*SetMapLeavesResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method SetLeaves not implemented")
+}
+func (*UnimplementedTrillianMapServer) GetSignedMapRoot(ctx context.Context, req *GetSignedMapRootRequest) (*GetSignedMapRootResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetSignedMapRoot not implemented")
+}
+func (*UnimplementedTrillianMapServer) GetSignedMapRootByRevision(ctx context.Context, req *GetSignedMapRootByRevisionRequest) (*GetSignedMapRootResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetSignedMapRootByRevision not implemented")
+}
+func (*UnimplementedTrillianMapServer) InitMap(ctx context.Context, req *InitMapRequest) (*InitMapResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method InitMap not implemented")
 }
 
 func RegisterTrillianMapServer(s *grpc.Server, srv TrillianMapServer) {
 	s.RegisterService(&_TrillianMap_serviceDesc, srv)
+}
+
+func _TrillianMap_GetLeaf_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetMapLeafRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TrillianMapServer).GetLeaf(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/trillian.TrillianMap/GetLeaf",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TrillianMapServer).GetLeaf(ctx, req.(*GetMapLeafRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _TrillianMap_GetLeafByRevision_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetMapLeafByRevisionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TrillianMapServer).GetLeafByRevision(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/trillian.TrillianMap/GetLeafByRevision",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TrillianMapServer).GetLeafByRevision(ctx, req.(*GetMapLeafByRevisionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
 }
 
 func _TrillianMap_GetLeaves_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
@@ -354,6 +1145,42 @@ func _TrillianMap_GetLeaves_Handler(srv interface{}, ctx context.Context, dec fu
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(TrillianMapServer).GetLeaves(ctx, req.(*GetMapLeavesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _TrillianMap_GetLeavesByRevision_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetMapLeavesByRevisionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TrillianMapServer).GetLeavesByRevision(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/trillian.TrillianMap/GetLeavesByRevision",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TrillianMapServer).GetLeavesByRevision(ctx, req.(*GetMapLeavesByRevisionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _TrillianMap_GetLastInRangeByRevision_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetLastInRangeByRevisionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TrillianMapServer).GetLastInRangeByRevision(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/trillian.TrillianMap/GetLastInRangeByRevision",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TrillianMapServer).GetLastInRangeByRevision(ctx, req.(*GetLastInRangeByRevisionRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -412,13 +1239,47 @@ func _TrillianMap_GetSignedMapRootByRevision_Handler(srv interface{}, ctx contex
 	return interceptor(ctx, in, info, handler)
 }
 
+func _TrillianMap_InitMap_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(InitMapRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TrillianMapServer).InitMap(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/trillian.TrillianMap/InitMap",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TrillianMapServer).InitMap(ctx, req.(*InitMapRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 var _TrillianMap_serviceDesc = grpc.ServiceDesc{
 	ServiceName: "trillian.TrillianMap",
 	HandlerType: (*TrillianMapServer)(nil),
 	Methods: []grpc.MethodDesc{
 		{
+			MethodName: "GetLeaf",
+			Handler:    _TrillianMap_GetLeaf_Handler,
+		},
+		{
+			MethodName: "GetLeafByRevision",
+			Handler:    _TrillianMap_GetLeafByRevision_Handler,
+		},
+		{
 			MethodName: "GetLeaves",
 			Handler:    _TrillianMap_GetLeaves_Handler,
+		},
+		{
+			MethodName: "GetLeavesByRevision",
+			Handler:    _TrillianMap_GetLeavesByRevision_Handler,
+		},
+		{
+			MethodName: "GetLastInRangeByRevision",
+			Handler:    _TrillianMap_GetLastInRangeByRevision_Handler,
 		},
 		{
 			MethodName: "SetLeaves",
@@ -432,51 +1293,11 @@ var _TrillianMap_serviceDesc = grpc.ServiceDesc{
 			MethodName: "GetSignedMapRootByRevision",
 			Handler:    _TrillianMap_GetSignedMapRootByRevision_Handler,
 		},
+		{
+			MethodName: "InitMap",
+			Handler:    _TrillianMap_InitMap_Handler,
+		},
 	},
 	Streams:  []grpc.StreamDesc{},
 	Metadata: "trillian_map_api.proto",
-}
-
-func init() { proto.RegisterFile("trillian_map_api.proto", fileDescriptor1) }
-
-var fileDescriptor1 = []byte{
-	// 608 bytes of a gzipped FileDescriptorProto
-	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x9c, 0x54, 0xcd, 0x6e, 0xd3, 0x40,
-	0x10, 0xc6, 0x49, 0x7f, 0xd2, 0x09, 0x42, 0x65, 0x5b, 0xa8, 0x31, 0x2d, 0x6a, 0x8d, 0x2a, 0xa8,
-	0x2a, 0xc5, 0x34, 0x9c, 0xe0, 0x46, 0x85, 0xd4, 0x16, 0x35, 0x55, 0x65, 0xa3, 0x22, 0x71, 0x20,
-	0x9a, 0x36, 0xdb, 0x64, 0x25, 0xdb, 0xbb, 0xd8, 0x9b, 0xa8, 0x50, 0xf5, 0xc2, 0x81, 0x07, 0x00,
-	0xce, 0xbc, 0x54, 0x5f, 0x81, 0x07, 0x41, 0xbb, 0xeb, 0xa4, 0x75, 0xe2, 0x84, 0x88, 0x9b, 0x3d,
-	0xdf, 0xcc, 0x37, 0xdf, 0x37, 0x33, 0x5a, 0x78, 0x28, 0x13, 0x16, 0x86, 0x0c, 0xe3, 0x66, 0x84,
-	0xa2, 0x89, 0x82, 0xd5, 0x44, 0xc2, 0x25, 0x27, 0x95, 0x7e, 0xdc, 0xb9, 0xd7, 0xff, 0x32, 0x88,
-	0xb3, 0xda, 0xe6, 0xbc, 0x1d, 0x52, 0x0f, 0x05, 0xf3, 0x30, 0x8e, 0xb9, 0x44, 0xc9, 0x78, 0x9c,
-	0x1a, 0xd4, 0xfd, 0x0a, 0xf3, 0x0d, 0x14, 0x87, 0x14, 0xcf, 0xc9, 0x32, 0xcc, 0xb2, 0xb8, 0x45,
-	0x2f, 0x6c, 0x6b, 0xdd, 0x7a, 0x7e, 0xd7, 0x37, 0x3f, 0xe4, 0x31, 0x2c, 0x84, 0x14, 0xcf, 0x9b,
-	0x1d, 0x4c, 0x3b, 0x76, 0x49, 0x23, 0x15, 0x15, 0xd8, 0xc7, 0xb4, 0x43, 0xd6, 0x00, 0x34, 0xd8,
-	0xc3, 0xb0, 0x4b, 0xed, 0xb2, 0x46, 0x75, 0xfa, 0x89, 0x0a, 0x28, 0x98, 0x5e, 0xc8, 0x04, 0x9b,
-	0x2d, 0x94, 0x68, 0xcf, 0x18, 0x58, 0x47, 0xde, 0xa2, 0x44, 0xf7, 0x03, 0x2c, 0x66, 0xbd, 0x0f,
-	0xe2, 0xb3, 0xb0, 0x9b, 0x32, 0x1e, 0x93, 0x4d, 0x98, 0x51, 0xf5, 0x5a, 0x43, 0xb5, 0x7e, 0xbf,
-	0x36, 0x30, 0x93, 0x65, 0xfa, 0x1a, 0x26, 0xab, 0xb0, 0xc0, 0xfa, 0x35, 0x76, 0x69, 0xbd, 0xac,
-	0x88, 0x07, 0x01, 0xf7, 0x13, 0x2c, 0xed, 0x51, 0x69, 0x2a, 0x7a, 0x34, 0xf5, 0xe9, 0xe7, 0x2e,
-	0x4d, 0x25, 0x79, 0x00, 0x73, 0x6a, 0x68, 0xac, 0xa5, 0xd9, 0xcb, 0xfe, 0x6c, 0x84, 0xe2, 0xa0,
-	0x75, 0xe3, 0xdb, 0xf0, 0x64, 0xbe, 0x1d, 0xa8, 0x24, 0xb4, 0xc7, 0x74, 0x83, 0xb2, 0x4e, 0x1f,
-	0xfc, 0xbb, 0xbf, 0x2c, 0x58, 0xce, 0x37, 0x48, 0x05, 0x8f, 0x53, 0x4a, 0xf6, 0x81, 0xa8, 0x0e,
-	0x7a, 0x26, 0x79, 0x7d, 0xd5, 0xba, 0x33, 0xe2, 0x65, 0xe0, 0xda, 0x5f, 0x8c, 0x86, 0xe7, 0x50,
-	0x87, 0x8a, 0x62, 0x4a, 0x38, 0x97, 0xba, 0x7d, 0xb5, 0xbe, 0x72, 0x53, 0x1f, 0xb0, 0x76, 0x4c,
-	0x5b, 0x0d, 0x14, 0x3e, 0xe7, 0xd2, 0x9f, 0x8f, 0xcc, 0x87, 0xfb, 0xc3, 0x82, 0xa5, 0x60, 0x7a,
-	0xdf, 0x5b, 0x30, 0x17, 0xea, 0xbc, 0x4c, 0x60, 0xc1, 0xb0, 0xb3, 0x04, 0xf2, 0x0a, 0xaa, 0x11,
-	0x0a, 0x41, 0x13, 0xb3, 0x49, 0x23, 0xc8, 0xce, 0xe5, 0x0b, 0x9a, 0x34, 0xa8, 0x44, 0x85, 0xfb,
-	0x60, 0x92, 0xf5, 0x92, 0xdf, 0xc1, 0x72, 0x50, 0x34, 0xaa, 0xdb, 0x06, 0x4b, 0x53, 0x1a, 0x7c,
-	0x01, 0x2b, 0x7b, 0x54, 0xe6, 0xc1, 0x89, 0x1e, 0xdd, 0x13, 0xd8, 0x18, 0xae, 0xd8, 0xfd, 0xe2,
-	0x67, 0x7b, 0xfc, 0xc7, 0x7c, 0x6e, 0x5f, 0x40, 0x69, 0xe8, 0x02, 0x8e, 0xc0, 0x1e, 0x55, 0xf2,
-	0xff, 0xce, 0xea, 0xd7, 0x65, 0xa8, 0xbe, 0xcf, 0x72, 0x1a, 0x28, 0xc8, 0x21, 0x2c, 0xec, 0x51,
-	0x69, 0x46, 0x46, 0xd6, 0x6e, 0xca, 0x0b, 0xce, 0xda, 0x79, 0x32, 0x0e, 0x36, 0x7a, 0xdc, 0x3b,
-	0x8a, 0x2d, 0x28, 0x62, 0x0b, 0x26, 0xb3, 0x05, 0xc5, 0x6c, 0xdf, 0x2d, 0x58, 0x1c, 0x36, 0x4f,
-	0x36, 0x72, 0x22, 0x8a, 0x56, 0xe4, 0xb8, 0x93, 0x52, 0x32, 0xf6, 0xed, 0x6f, 0xd7, 0x7f, 0x7e,
-	0x96, 0x36, 0xc9, 0x53, 0xaf, 0xb7, 0x73, 0x4a, 0x25, 0xee, 0x78, 0x11, 0x8a, 0xd4, 0xbb, 0x34,
-	0xfb, 0xb9, 0xf2, 0xd4, 0x50, 0xd3, 0xd7, 0x21, 0x4a, 0xb5, 0xb7, 0xdf, 0x16, 0x38, 0xe3, 0xb7,
-	0x4b, 0xb6, 0xc7, 0xf7, 0x1b, 0xb9, 0x81, 0xa9, 0xc4, 0x79, 0x5a, 0xdc, 0x16, 0x79, 0x36, 0x49,
-	0x9c, 0x77, 0xd9, 0x3f, 0x92, 0xab, 0xdd, 0x23, 0x78, 0x74, 0xc6, 0xa3, 0x9a, 0x79, 0x80, 0x6b,
-	0xf9, 0x77, 0x79, 0x77, 0xe9, 0xd6, 0xbe, 0xdf, 0x08, 0x76, 0xac, 0x82, 0xc7, 0xd6, 0x47, 0xa7,
-	0xcd, 0x64, 0xa7, 0x7b, 0x5a, 0x3b, 0xe3, 0x91, 0x97, 0xbd, 0xdc, 0xfd, 0xc2, 0xd3, 0x39, 0x5d,
-	0xf9, 0xf2, 0x6f, 0x00, 0x00, 0x00, 0xff, 0xff, 0xe3, 0x5a, 0x04, 0x25, 0x05, 0x06, 0x00, 0x00,
 }

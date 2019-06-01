@@ -114,7 +114,7 @@ var testProofs = []proofTestVector{
 func decodeHexStringOrPanic(hs string) []byte {
 	data, err := hex.DecodeString(hs)
 	if err != nil {
-		panic(fmt.Errorf("Failed to decode test data: %s", hs))
+		panic(fmt.Errorf("failed to decode test data: %s", hs))
 	}
 
 	return data
@@ -152,7 +152,7 @@ func getRootAsString(mt InMemoryMerkleTree, leaf int64) string {
 // Get the largest power of two smaller than i.
 func downToPowerOfTwo(i int64) int64 {
 	if i < 2 {
-		panic(errors.New("Requested downToPowerOf2 for value < 2"))
+		panic(errors.New("requested downToPowerOf2 for value < 2"))
 	}
 
 	// Find the smallest power of two greater than or equal to i. We
@@ -168,35 +168,39 @@ func downToPowerOfTwo(i int64) int64 {
 }
 
 // Reference implementation of Merkle hash, for cross-checking.
-func referenceMerkleTreeHash(inputs [][]byte, treehasher hashers.LogHasher) []byte {
+func referenceMerkleTreeHash(inputs [][]byte, treehasher hashers.LogHasher) ([]byte, error) {
 	if len(inputs) == 0 {
-		return treehasher.EmptyRoot()
+		return treehasher.EmptyRoot(), nil
 	}
-
 	if len(inputs) == 1 {
-		return treehasher.HashLeaf(inputs[0])
+		return treehasher.HashLeaf(inputs[0]), nil
 	}
 
 	split := downToPowerOfTwo(int64(len(inputs)))
 
-	lhs := TreeEntry{referenceMerkleTreeHash(inputs[:split], treehasher)}
-	rhs := TreeEntry{referenceMerkleTreeHash(inputs[split:], treehasher)}
-
-	return treehasher.HashChildren(lhs.hash, rhs.hash)
+	lhs, err := referenceMerkleTreeHash(inputs[:split], treehasher)
+	if err != nil {
+		return nil, err
+	}
+	rhs, err := referenceMerkleTreeHash(inputs[split:], treehasher)
+	if err != nil {
+		return nil, err
+	}
+	return treehasher.HashChildren(lhs, rhs), nil
 }
 
 // Reference implementation of Merkle paths. Path from leaf to root,
 // excluding the leaf and root themselves.
-func referenceMerklePath(inputs [][]byte, leaf int64, treehasher hashers.LogHasher) [][]byte {
+func referenceMerklePath(inputs [][]byte, leaf int64, treehasher hashers.LogHasher) ([][]byte, error) {
 	var path [][]byte
 
 	inputLen := int64(len(inputs))
 	if leaf > inputLen || leaf == 0 {
-		return path
+		return path, nil
 	}
 
 	if inputLen == 1 {
-		return path
+		return path, nil
 	}
 
 	split := downToPowerOfTwo(inputLen)
@@ -204,27 +208,43 @@ func referenceMerklePath(inputs [][]byte, leaf int64, treehasher hashers.LogHash
 	var subpath [][]byte
 
 	if leaf <= split {
-		subpath = referenceMerklePath(inputs[:split], leaf, treehasher)
+		s, err := referenceMerklePath(inputs[:split], leaf, treehasher)
+		if err != nil {
+			return nil, err
+		}
+		subpath = s
 		path = append(path, subpath...)
-		path = append(path, referenceMerkleTreeHash(inputs[split:], treehasher))
+		refHash, err := referenceMerkleTreeHash(inputs[split:], treehasher)
+		if err != nil {
+			return nil, err
+		}
+		path = append(path, refHash)
 	} else {
-		subpath = referenceMerklePath(inputs[split:], leaf-split, treehasher)
+		s, err := referenceMerklePath(inputs[split:], leaf-split, treehasher)
+		if err != nil {
+			return nil, err
+		}
+		subpath = s
 		path = append(path, subpath...)
-		path = append(path, referenceMerkleTreeHash(inputs[:split], treehasher))
+		refHash, err := referenceMerkleTreeHash(inputs[:split], treehasher)
+		if err != nil {
+			return nil, err
+		}
+		path = append(path, refHash)
 	}
 
-	return path
+	return path, nil
 }
 
 // Reference implementation of snapshot consistency.
 // Call with haveRoot1 = true.
 func referenceSnapshotConsistency(inputs [][]byte, snapshot2 int64,
-	snapshot1 int64, treehasher hashers.LogHasher, haveRoot1 bool) [][]byte {
+	snapshot1 int64, treehasher hashers.LogHasher, haveRoot1 bool) ([][]byte, error) {
 
 	var proof [][]byte
 
 	if snapshot1 == 0 || snapshot1 > snapshot2 {
-		return proof
+		return proof, nil
 	}
 
 	if snapshot1 == snapshot2 {
@@ -233,9 +253,13 @@ func referenceSnapshotConsistency(inputs [][]byte, snapshot2 int64,
 			// Record the hash of this subtree unless it's the root for which
 			// the proof was originally requested. (This happens when the snapshot1
 			// tree is balanced.)
-			proof = append(proof, referenceMerkleTreeHash(inputs[:snapshot1], treehasher))
+			refHash, err := referenceMerkleTreeHash(inputs[:snapshot1], treehasher)
+			if err != nil {
+				return nil, err
+			}
+			proof = append(proof, refHash)
 		}
-		return proof
+		return proof, nil
 	}
 
 	// 0 < snapshot1 < snapshot2
@@ -245,23 +269,37 @@ func referenceSnapshotConsistency(inputs [][]byte, snapshot2 int64,
 	if snapshot1 <= split {
 		// Root of snapshot1 is in the left subtree of snapshot2.
 		// Prove that the left subtrees are consistent.
-		subproof = referenceSnapshotConsistency(inputs[:split], split, snapshot1,
-			treehasher, haveRoot1)
+		s, err := referenceSnapshotConsistency(inputs[:split], split, snapshot1, treehasher, haveRoot1)
+		if err != nil {
+			return nil, err
+		}
+		subproof = s
 		proof = append(proof, subproof...)
 		// Record the hash of the right subtree (only present in snapshot2).
-		proof = append(proof, referenceMerkleTreeHash(inputs[split:], treehasher))
+		h, err := referenceMerkleTreeHash(inputs[split:], treehasher)
+		if err != nil {
+			return nil, err
+		}
+		proof = append(proof, h)
 	} else {
 		// Snapshot1 root is at the same level as snapshot2 root.
 		// Prove that the right subtrees are consistent. The right subtree
 		// doesn't contain the root of snapshot1, so set haveRoot1 = false.
-		subproof =
-			referenceSnapshotConsistency(inputs[split:], snapshot2-split,
-				snapshot1-split, treehasher, false)
+		s, err := referenceSnapshotConsistency(inputs[split:], snapshot2-split, snapshot1-split, treehasher, false)
+		if err != nil {
+			return nil, err
+		}
+		subproof = s
+
 		proof = append(proof, subproof...)
 		// Record the hash of the left subtree (equal in both trees).
-		proof = append(proof, referenceMerkleTreeHash(inputs[:split], treehasher))
+		refHash, err := referenceMerkleTreeHash(inputs[:split], treehasher)
+		if err != nil {
+			return nil, err
+		}
+		proof = append(proof, refHash)
 	}
-	return proof
+	return proof, nil
 }
 
 func TestEmptyTreeIsEmpty(t *testing.T) {
@@ -381,8 +419,10 @@ func TestReferenceMerklePathSanity(t *testing.T) {
 	}
 
 	for _, path := range testPaths {
-		referencePath := referenceMerklePath(data[:path.snapshot], path.leaf,
-			mt.hasher)
+		referencePath, err := referenceMerklePath(data[:path.snapshot], path.leaf, mt.hasher)
+		if err != nil {
+			t.Fatalf("referenceMerklePath(): %v", err)
+		}
 
 		if int64(len(referencePath)) != path.pathLength {
 			t.Errorf("Mismatched path length: %d, %d: %v %v",
@@ -415,9 +455,12 @@ func TestMerkleTreeRootFuzz(t *testing.T) {
 			snapshot := rand.Int63n(treeSize + 1)
 
 			h1 := mt.RootAtSnapshot(snapshot).hash
-			h2 := referenceMerkleTreeHash(data[:snapshot], mt.hasher)
+			h2, err := referenceMerkleTreeHash(data[:snapshot], mt.hasher)
+			if err != nil {
+				t.Fatalf("referenceMerkleTreeHash(): %v", err)
+			}
 
-			if bytes.Compare(h1, h2) != 0 {
+			if !bytes.Equal(h1, h2) {
 				t.Errorf("Mismatched hash: %x, %x", h1, h2)
 			}
 		}
@@ -450,13 +493,16 @@ func TestMerkleTreePathFuzz(t *testing.T) {
 			//	t.Logf("P %d: %d %d %v", i, p.xCoord, p.yCoord, p.value)
 			//}
 
-			p2 := referenceMerklePath(data[:snapshot], leaf, mt.hasher)
+			p2, err := referenceMerklePath(data[:snapshot], leaf, mt.hasher)
+			if err != nil {
+				t.Fatalf("referenceMerklePath(): %v", err)
+			}
 
 			if len(p1) != len(p2) {
 				t.Errorf("Different path lengths %v, %v", p1, p2)
 			} else {
 				for i := 0; i < len(p1); i++ {
-					if bytes.Compare(p1[i].Value.hash, p2[i]) != 0 {
+					if !bytes.Equal(p1[i].Value.hash, p2[i]) {
 						t.Errorf("Mismatched hash %d %d %d: %v, %v", snapshot, leaf, i,
 							p1[i].Value.hash, p2[i])
 					}
@@ -486,8 +532,10 @@ func TestMerkleTreeConsistencyFuzz(t *testing.T) {
 			snapshot1 := rand.Int63n(snapshot2 + 1)
 
 			c1 := mt.SnapshotConsistency(snapshot1, snapshot2)
-			c2 := referenceSnapshotConsistency(data[:snapshot2], snapshot2,
-				snapshot1, mt.hasher, true)
+			c2, err := referenceSnapshotConsistency(data[:snapshot2], snapshot2, snapshot1, mt.hasher, true)
+			if err != nil {
+				t.Fatalf("referenceSnapshotConsistency(): %v", err)
+			}
 
 			if len(c1) != len(c2) {
 				t.Errorf("Different proof lengths: %d %d %d", treeSize, snapshot2,
@@ -495,7 +543,7 @@ func TestMerkleTreeConsistencyFuzz(t *testing.T) {
 			}
 
 			for i := 0; i < len(c1); i++ {
-				if bytes.Compare(c1[i].Value.hash, c2[i]) != 0 {
+				if !bytes.Equal(c1[i].Value.hash, c2[i]) {
 					t.Errorf("Different proof: %d %d %d %d, %s, %s", treeSize,
 						snapshot2, snapshot1, i, hex.EncodeToString(c1[i].Value.hash),
 						hex.EncodeToString(c2[i]))
@@ -517,7 +565,7 @@ func TestMerkleTreePathBuildOnce(t *testing.T) {
 		t.Fatalf("8 leaves added but tree size is %d", mt.LeafCount())
 	}
 
-	if bytes.Compare(mt.CurrentRoot().hash, decodeHexStringOrPanic(rootsAtSize[7])) != 0 {
+	if !bytes.Equal(mt.CurrentRoot().hash, decodeHexStringOrPanic(rootsAtSize[7])) {
 		t.Fatalf("Got unexpected root hash: %s %s",
 			hex.EncodeToString(mt.CurrentRoot().hash), rootsAtSize[7])
 	}
@@ -541,7 +589,7 @@ func TestMerkleTreePathBuildOnce(t *testing.T) {
 		}
 
 		for j := range p2 {
-			if got, want := p1[j].Value.hash, decodeHexStringOrPanic(testPaths[i].testVector[j]); bytes.Compare(got, want) != 0 {
+			if got, want := p1[j].Value.hash, decodeHexStringOrPanic(testPaths[i].testVector[j]); !bytes.Equal(got, want) {
 				t.Errorf("Path mismatch: got: %v want: %v", got, want)
 			}
 		}
@@ -580,7 +628,7 @@ func TestMerkleTreePathBuildIncrementally(t *testing.T) {
 			}
 
 			for j := 0; j < len(p2); j++ {
-				if bytes.Compare(p1[j].Value.hash, p2[j].Value.hash) != 0 {
+				if !bytes.Equal(p1[j].Value.hash, p2[j].Value.hash) {
 					t.Errorf("Path mismatch: %s %s", hex.EncodeToString(p1[j].Value.hash),
 						hex.EncodeToString(p2[j].Value.hash))
 				}
@@ -608,7 +656,7 @@ func TestProofConsistencyTestVectors(t *testing.T) {
 		t.FailNow()
 	}
 
-	if bytes.Compare(mt.CurrentRoot().hash, decodeHexStringOrPanic(rootsAtSize[7])) != 0 {
+	if !bytes.Equal(mt.CurrentRoot().hash, decodeHexStringOrPanic(rootsAtSize[7])) {
 		t.Errorf("Got unexpected root hash: %s %s",
 			hex.EncodeToString(mt.CurrentRoot().hash), rootsAtSize[7])
 		t.FailNow()
@@ -628,7 +676,7 @@ func TestProofConsistencyTestVectors(t *testing.T) {
 		}
 
 		for j := 0; j < len(p2); j++ {
-			if got, want := p1[j].Value.hash, decodeHexStringOrPanic(testProofs[i].proof[j]); bytes.Compare(got, want) != 0 {
+			if got, want := p1[j].Value.hash, decodeHexStringOrPanic(testProofs[i].proof[j]); !bytes.Equal(got, want) {
 				t.Errorf("Path mismatch: got: %v want: %v", got, want)
 			}
 		}
@@ -645,7 +693,7 @@ func TestAddLeafHash(t *testing.T) {
 		t.Errorf("Expected 1 for first leaf sequence number but got: %d", index)
 	}
 
-	if bytes.Compare(decodeHexStringOrPanic(hash), treeEntry.hash) != 0 {
+	if !bytes.Equal(decodeHexStringOrPanic(hash), treeEntry.hash) {
 		t.Error("Hash value was not copied into leaf correctly")
 	}
 }
@@ -660,7 +708,7 @@ func TestHashAccessor(t *testing.T) {
 		t.Errorf("Expected 1 for first leaf sequence number but got: %d", index)
 	}
 
-	if bytes.Compare(decodeHexStringOrPanic(hash), treeEntry.Hash()) != 0 {
+	if !bytes.Equal(decodeHexStringOrPanic(hash), treeEntry.Hash()) {
 		t.Error("Hash value was not copied into leaf correctly")
 	}
 }
@@ -678,7 +726,7 @@ func TestHashIntoAccessor(t *testing.T) {
 	var dest []byte
 	dest = treeEntry.HashInto(dest)
 
-	if bytes.Compare(decodeHexStringOrPanic(hash), dest) != 0 {
+	if !bytes.Equal(decodeHexStringOrPanic(hash), dest) {
 		t.Error("Hash value was not copied into leaf correctly")
 	}
 
@@ -688,7 +736,7 @@ func TestHashIntoAccessor(t *testing.T) {
 
 	dest[0] = dest[0] + 1 // Make the hash invalid
 
-	if bytes.Compare(decodeHexStringOrPanic(hash), treeEntry.HashInto(dest)) != 0 {
+	if !bytes.Equal(decodeHexStringOrPanic(hash), treeEntry.HashInto(dest)) {
 		t.Error("Hash value was not copied into leaf correctly")
 	}
 }

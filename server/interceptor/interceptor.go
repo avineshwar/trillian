@@ -16,17 +16,20 @@
 package interceptor
 
 import (
+	"context"
 	"fmt"
+	"regexp"
 	"sync"
+	"time"
 
 	"github.com/golang/glog"
 	"github.com/google/trillian"
 	"github.com/google/trillian/monitoring"
 	"github.com/google/trillian/quota"
+	"github.com/google/trillian/quota/etcd/quotapb"
 	"github.com/google/trillian/server/errors"
 	"github.com/google/trillian/storage"
 	"github.com/google/trillian/trees"
-	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -36,12 +39,29 @@ const (
 	badInfoReason            = "bad_info"
 	badTreeReason            = "bad_tree"
 	insufficientTokensReason = "insufficient_tokens"
+	getTreeStage             = "get_tree"
+	getTokensStage           = "get_tokens"
+	traceSpanRoot            = "/trillian/server/int"
 )
 
 var (
+	// PutTokensTimeout is the timeout used for PutTokens calls.
+	// PutTokens happens in a separate goroutine and with an independent context, therefore it has
+	// its own timeout, separate from the RPC that causes the calls.
+	PutTokensTimeout = 5 * time.Second
+
 	requestCounter       monitoring.Counter
 	requestDeniedCounter monitoring.Counter
-	metricsOnce          = sync.Once{}
+	contextErrCounter    monitoring.Counter
+	metricsOnce          sync.Once
+	enabledServices      = map[string]bool{
+		"trillian.TrillianLog":   true,
+		"trillian.TrillianMap":   true,
+		"trillian.TrillianAdmin": true,
+		"TrillianLog":            true,
+		"TrillianMap":            true,
+		"TrillianAdmin":          true,
+	}
 )
 
 // RequestProcessor encapsulates the logic to intercept a request, split into separate stages:
@@ -51,12 +71,12 @@ type RequestProcessor interface {
 	// Before implements all interceptor logic that happens before the handler is called.
 	// It returns a (potentially) modified context that's passed forward to the handler (and After),
 	// plus an error, in case the request should be interrupted before the handler is invoked.
-	Before(ctx context.Context, req interface{}) (context.Context, error)
+	Before(ctx context.Context, req interface{}, method string) (context.Context, error)
 
 	// After implements all interceptor logic that happens after the handler is invoked.
 	// Before must be invoked prior to After and the same RequestProcessor instance must to be used
 	// to process a given request.
-	After(ctx context.Context, resp interface{}, handlerErr error)
+	After(ctx context.Context, resp interface{}, method string, handlerErr error)
 }
 
 // TrillianInterceptor checks that:
@@ -95,6 +115,10 @@ func initMetrics(mf monitoring.MetricFactory) {
 		"interceptor_request_denied_count",
 		"Number of requests by denied, labeled according to the reason for denial",
 		"reason", monitoring.TreeIDLabel, "quota_user")
+	contextErrCounter = mf.NewCounter(
+		"interceptor_context_err_counter",
+		"Total number of times request context has been cancelled or deadline exceeded by stage",
+		"stage")
 }
 
 func incRequestDeniedCounter(reason string, treeID int64, quotaUser string) {
@@ -102,17 +126,19 @@ func incRequestDeniedCounter(reason string, treeID int64, quotaUser string) {
 }
 
 // UnaryInterceptor executes the TrillianInterceptor logic for unary RPCs.
-func (i *TrillianInterceptor) UnaryInterceptor(ctx context.Context, req interface{}, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-	// Implement UnaryInterceptor using a RequestProcessor, so we 1. exercise it and 2. make it
-	// easier to port this logic to non-gRPC implementations.
+func (i *TrillianInterceptor) UnaryInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+	// Implement UnaryInterceptor using a RequestProcessor, so we
+	// 1. exercise it
+	// 2. make it easier to port this logic to non-gRPC implementations.
+
 	rp := i.NewProcessor()
 	var err error
-	ctx, err = rp.Before(ctx, req)
+	ctx, err = rp.Before(ctx, req, info.FullMethod)
 	if err != nil {
 		return nil, err
 	}
 	resp, err := handler(ctx, req)
-	rp.After(ctx, resp, err)
+	rp.After(ctx, resp, info.FullMethod, err)
 	return resp, err
 }
 
@@ -126,50 +152,71 @@ type trillianProcessor struct {
 	info   *rpcInfo
 }
 
-func (tp *trillianProcessor) Before(ctx context.Context, req interface{}) (context.Context, error) {
-	defer func() {
-		var treeID int64
-		if tp.info != nil {
-			treeID = tp.info.treeID
-		}
-		requestCounter.Inc(fmt.Sprint(treeID))
-	}()
+func (tp *trillianProcessor) Before(ctx context.Context, req interface{}, method string) (context.Context, error) {
+	// Skip if the interceptor is not enabled for this service.
+	if !enabledServices[serviceName(method)] {
+		return ctx, nil
+	}
 
-	quotaUser := tp.parent.qm.GetUser(ctx, req)
-	info, err := getRPCInfo(req, quotaUser)
+	// Don't want the Before to contain the action, so don't overwrite the ctx.
+	innerCtx, spanEnd := spanFor(ctx, "Before")
+	defer spanEnd()
+	info, err := newRPCInfo(req)
 	if err != nil {
-		incRequestDeniedCounter(badInfoReason, 0, quotaUser)
+		glog.Warningf("Failed to read tree info: %v", err)
+		incRequestDeniedCounter(badInfoReason, 0, "")
 		return ctx, err
 	}
 	tp.info = info
+	requestCounter.Inc(fmt.Sprint(info.treeID))
 
-	if info.treeID != 0 {
-		tree, err := trees.GetTree(ctx, tp.parent.admin, info.treeID, info.opts)
+	// TODO(codingllama): Add auth interception
+
+	if info.getTree {
+		tree, err := trees.GetTree(
+			innerCtx, tp.parent.admin, info.treeID, trees.NewGetOpts(trees.Admin, info.treeTypes...))
 		if err != nil {
-			incRequestDeniedCounter(badTreeReason, info.treeID, quotaUser)
+			incRequestDeniedCounter(badTreeReason, info.treeID, info.quotaUsers)
+			return ctx, err
+		}
+		if err := innerCtx.Err(); err != nil {
+			contextErrCounter.Inc(getTreeStage)
 			return ctx, err
 		}
 		ctx = trees.NewContext(ctx, tree)
-		// TODO(codingllama): Add auth interception
 	}
 
-	if len(info.specs) > 0 && info.tokens > 0 {
-		err := tp.parent.qm.GetTokens(ctx, info.tokens, info.specs)
+	if info.tokens > 0 && len(info.specs) > 0 {
+		err := tp.parent.qm.GetTokens(innerCtx, info.tokens, info.specs)
 		if err != nil {
 			if !tp.parent.quotaDryRun {
-				incRequestDeniedCounter(insufficientTokensReason, info.treeID, quotaUser)
+				incRequestDeniedCounter(insufficientTokensReason, info.treeID, info.quotaUsers)
 				return ctx, status.Errorf(codes.ResourceExhausted, "quota exhausted: %v", err)
 			}
 			glog.Warningf("(quotaDryRun) Request %+v not denied due to dry run mode: %v", req, err)
 		}
-		quota.Metrics.IncAcquired(info.tokens, info.specs, err != nil)
+		quota.Metrics.IncAcquired(info.tokens, info.specs, err == nil)
+		if err = innerCtx.Err(); err != nil {
+			contextErrCounter.Inc(getTokensStage)
+			return ctx, err
+		}
 	}
+
 	return ctx, nil
 }
 
-func (tp *trillianProcessor) After(ctx context.Context, resp interface{}, handlerErr error) {
-	if tp.info == nil {
+func (tp *trillianProcessor) After(ctx context.Context, resp interface{}, method string, handlerErr error) {
+	if !enabledServices[serviceName(method)] {
+		return
+	}
+	_, spanEnd := spanFor(ctx, "After")
+	defer spanEnd()
+	switch {
+	case tp.info == nil:
 		glog.Warningf("After called with nil rpcInfo, resp = [%+v], handlerErr = [%v]", resp, handlerErr)
+		return
+	case tp.info.tokens == 0:
+		// After() currently only does quota processing
 		return
 	}
 
@@ -189,6 +236,12 @@ func (tp *trillianProcessor) After(ctx context.Context, resp interface{}, handle
 			if !isLeafOK(resp.GetQueuedLeaf()) {
 				tokens = 1
 			}
+		case *trillian.AddSequencedLeavesResponse:
+			for _, leaf := range resp.GetResults() {
+				if !isLeafOK(leaf) {
+					tokens++
+				}
+			}
 		case *trillian.QueueLeavesResponse:
 			for _, leaf := range resp.GetQueuedLeaves() {
 				if !isLeafOK(leaf) {
@@ -197,16 +250,25 @@ func (tp *trillianProcessor) After(ctx context.Context, resp interface{}, handle
 			}
 		}
 	}
-	if tokens > 0 && len(tp.info.specs) > 0 {
-		// TODO(codingllama): If PutTokens turns out to be unreliable we can still leak tokens. In
-		// this case, we may want to keep tabs on how many tokens we failed to replenish and bundle
-		// them up in the next PutTokens call (possibly as a QuotaManager decorator, or internally
-		// in its impl).
-		err := tp.parent.qm.PutTokens(ctx, tokens, tp.info.specs)
-		if err != nil {
-			glog.Warningf("Failed to replenish %v tokens: %v", tokens, err)
-		}
-		quota.Metrics.IncReturned(tokens, tp.info.specs, err != nil)
+	if len(tp.info.specs) > 0 && tokens > 0 {
+		// Run PutTokens in a separate goroutine and with a separate context.
+		// It shouldn't block RPC completion, nor should it share the RPC's context deadline.
+		go func() {
+			ctx, spanEnd := spanFor(context.Background(), "After.PutTokens")
+			defer spanEnd()
+			ctx, cancel := context.WithTimeout(ctx, PutTokensTimeout)
+			defer cancel()
+
+			// TODO(codingllama): If PutTokens turns out to be unreliable we can still leak tokens. In
+			// this case, we may want to keep tabs on how many tokens we failed to replenish and bundle
+			// them up in the next PutTokens call (possibly as a QuotaManager decorator, or internally
+			// in its impl).
+			err := tp.parent.qm.PutTokens(ctx, tokens, tp.info.specs)
+			if err != nil {
+				glog.Warningf("Failed to replenish %v tokens: %v", tokens, err)
+			}
+			quota.Metrics.IncReturned(tokens, tp.info.specs, err == nil)
+		}()
 	}
 }
 
@@ -215,162 +277,223 @@ func isLeafOK(leaf *trillian.QueuedLogLeaf) bool {
 	return leaf == nil || leaf.Status == nil || leaf.Status.Code == int32(codes.OK)
 }
 
-// rpcInfo contains information about an RPC, as extracted from its request message.
+var fullyQualifiedRE = regexp.MustCompile(`^/([\w.]+)/(\w+)$`)
+var unqualifiedRE = regexp.MustCompile(`^/(\w+)\.(\w+)$`)
+
+// serviceName returns the fully qualified service name
+// "some.package.service" for "/some.package.service/method".
+// It returns the unqualified service name "service" for "/service.method".
+func serviceName(fullMethod string) string {
+	if matches := fullyQualifiedRE.FindStringSubmatch(fullMethod); len(matches) == 3 {
+		return matches[1]
+	}
+	if matches := unqualifiedRE.FindStringSubmatch(fullMethod); len(matches) == 3 {
+		return matches[1]
+	}
+	return ""
+}
+
 type rpcInfo struct {
-	// treeID is the tree ID tied to this RPC, if any (zero means no tree).
-	treeID int64
+	// getTree indicates whether the interceptor should populate treeID.
+	getTree bool
 
-	// opts is the trees.GetOpts appropriate to this RPC (TreeType, readonly vs readwrite, etc).
-	// opts is not set if doesNotHaveTree is true.
-	opts trees.GetOpts
+	readonly  bool
+	treeID    int64
+	treeTypes []trillian.TreeType
 
-	// specs contains the quota specifications for this RPC.
-	specs []quota.Spec
-
-	// tokens is number of quota tokens consumed by this request.
+	specs  []quota.Spec
 	tokens int
+	// Single string describing all of the users against which quota is requested.
+	quotaUsers string
 }
 
-// getRPCInfo returns the rpcInfo for the given request, or an error if the request is not mapped.
-// RPCs are mapped using the following logic:
-// treeID is acquired via one of the "Request" interfaces defined below (treeIDRequest,
-// logIDRequest, mapIDRequest, etc). Requests must implement to one of those.
-// TreeType and Readonly are determined based on the request type.
-func getRPCInfo(req interface{}, quotaUser string) (*rpcInfo, error) {
-	var treeID int64
+// chargable is satisfied by request proto messages which contain a GetChargeTo
+// accessor.
+type chargable interface {
+	GetChargeTo() *trillian.ChargeTo
+}
+
+// chargedUsers returns user identifiers for any chargable user quotas.
+func chargedUsers(req interface{}) []string {
+	c, ok := req.(chargable)
+	if !ok {
+		return nil
+	}
+	chargeTo := c.GetChargeTo()
+	if chargeTo == nil {
+		return nil
+	}
+
+	return chargeTo.User
+}
+
+func newRPCInfoForRequest(req interface{}) (*rpcInfo, error) {
+	// Set "safe" defaults: enable all interception and assume requests are readonly.
+	info := &rpcInfo{
+		getTree:   true,
+		readonly:  true,
+		treeTypes: nil,
+		tokens:    0,
+	}
+
 	switch req := req.(type) {
+
+	// Not intercepted at all
+	case
+		// Quota configuration requests
+		*quotapb.CreateConfigRequest,
+		*quotapb.DeleteConfigRequest,
+		*quotapb.GetConfigRequest,
+		*quotapb.ListConfigsRequest,
+		*quotapb.UpdateConfigRequest:
+		info.getTree = false
+		info.readonly = false // Doesn't really matter as all interceptors are turned off
+
+	// Admin create
 	case *trillian.CreateTreeRequest:
-		// OK, tree is being created
+		info.getTree = false // Tree doesn't exist
+		info.readonly = false
+
+	// Admin list
 	case *trillian.ListTreesRequest:
-		// OK, no single tree ID (potentially many trees)
-	case treeIDRequest:
-		treeID = req.GetTreeId()
-	case treeRequest:
-		treeID = req.GetTree().GetTreeId()
-	case logIDRequest:
-		treeID = req.GetLogId()
-	case mapIDRequest:
-		treeID = req.GetMapId()
-	default:
-		return nil, status.Errorf(codes.Internal, "cannot retrieve treeID from request: %T", req)
-	}
+		info.getTree = false // Zero to many trees
 
-	treeType, readonly, err := getRequestInfo(req)
-	if err != nil {
-		return nil, err
-	}
+	// Admin / readonly
+	case *trillian.GetTreeRequest:
+		info.getTree = false // Read done within RPC handler
 
-	kind := quota.Read
-	if !readonly {
-		kind = quota.Write
-	}
-	var specs []quota.Spec
-	switch {
-	case treeType == trillian.TreeType_UNKNOWN_TREE_TYPE:
-		// Don't impose quota on Admin requests.
-		// Sequencing-based replenishment is not tied in any way to Admin, so charging tokens for it
-		// leads to direct leakage.
-		// Admin is meant to be internal and unlikely to be a source of high QPS, in any case.
-	case treeID == 0:
-		specs = []quota.Spec{
-			{Group: quota.User, Kind: kind, User: quotaUser},
-			{Group: quota.Global, Kind: kind},
-		}
-	default:
-		specs = []quota.Spec{
-			{Group: quota.User, Kind: kind, User: quotaUser},
-			{Group: quota.Tree, Kind: kind, TreeID: treeID},
-			{Group: quota.Global, Kind: kind},
-		}
-	}
-
-	tokens := 1
-	switch req := req.(type) {
-	case logLeavesRequest:
-		tokens = len(req.GetLeaves())
-	case mapLeavesRequest:
-		tokens = len(req.GetLeaves())
-	}
-
-	return &rpcInfo{
-		treeID: treeID,
-		opts:   trees.GetOpts{TreeType: treeType, Readonly: readonly},
-		specs:  specs,
-		tokens: tokens,
-	}, nil
-}
-
-func getRequestInfo(req interface{}) (trillian.TreeType, bool, error) {
-	if readonly, ok := getAdminRequestInfo(req); ok {
-		return trillian.TreeType_UNKNOWN_TREE_TYPE, readonly, nil
-	}
-	if readonly, ok := getLogRequestInfo(req); ok {
-		return trillian.TreeType_LOG, readonly, nil
-	}
-	if readonly, ok := getMapRequestInfo(req); ok {
-		return trillian.TreeType_MAP, readonly, nil
-	}
-	return trillian.TreeType_UNKNOWN_TREE_TYPE, false, fmt.Errorf("unmapped request type: %T", req)
-}
-
-func getAdminRequestInfo(req interface{}) (bool, bool) {
-	readonly := false
-	ok := true
-	switch req.(type) {
-	case *trillian.GetTreeRequest,
-		*trillian.ListTreesRequest:
-		readonly = true
-	case *trillian.CreateTreeRequest,
-		*trillian.DeleteTreeRequest,
+	// Admin / readwrite
+	case *trillian.DeleteTreeRequest,
+		*trillian.UndeleteTreeRequest,
 		*trillian.UpdateTreeRequest:
-	default:
-		ok = false
-	}
-	return readonly, ok
-}
+		info.getTree = false // Read-modify-write done within RPC handler
+		info.readonly = false
 
-func getLogRequestInfo(req interface{}) (bool, bool) {
-	readonly := false
-	ok := true
-	switch req.(type) {
+	// (Log + Pre-ordered Log) / readonly
 	case *trillian.GetConsistencyProofRequest,
 		*trillian.GetEntryAndProofRequest,
 		*trillian.GetInclusionProofByHashRequest,
 		*trillian.GetInclusionProofRequest,
-		*trillian.GetLatestSignedLogRootRequest,
-		*trillian.GetLeavesByHashRequest,
-		*trillian.GetLeavesByIndexRequest,
-		*trillian.GetSequencedLeafCountRequest:
-		readonly = true
-	case *trillian.QueueLeafRequest,
-		*trillian.QueueLeavesRequest:
-	default:
-		ok = false
-	}
-	return readonly, ok
-}
+		*trillian.GetLatestSignedLogRootRequest:
+		info.treeTypes = []trillian.TreeType{trillian.TreeType_LOG, trillian.TreeType_PREORDERED_LOG}
+		info.tokens = 1
+	case *trillian.GetLeavesByHashRequest:
+		info.treeTypes = []trillian.TreeType{trillian.TreeType_LOG, trillian.TreeType_PREORDERED_LOG}
+		info.tokens = len(req.GetLeafHash())
+	case *trillian.GetLeavesByIndexRequest:
+		info.treeTypes = []trillian.TreeType{trillian.TreeType_LOG, trillian.TreeType_PREORDERED_LOG}
+		info.tokens = len(req.GetLeafIndex())
+	case *trillian.GetLeavesByRangeRequest:
+		info.treeTypes = []trillian.TreeType{trillian.TreeType_LOG, trillian.TreeType_PREORDERED_LOG}
+		info.tokens = 1
+		if c := req.GetCount(); c > 1 {
+			info.tokens = int(c)
+		}
+	case *trillian.GetSequencedLeafCountRequest:
+		info.treeTypes = []trillian.TreeType{trillian.TreeType_LOG, trillian.TreeType_PREORDERED_LOG}
 
-func getMapRequestInfo(req interface{}) (bool, bool) {
-	readonly := false
-	ok := true
-	switch req.(type) {
-	case *trillian.GetMapLeavesRequest,
-		*trillian.GetSignedMapRootByRevisionRequest,
+	// Log / readwrite
+	case *trillian.QueueLeafRequest:
+		info.readonly = false
+		info.treeTypes = []trillian.TreeType{trillian.TreeType_LOG}
+		info.tokens = 1
+	case *trillian.QueueLeavesRequest:
+		info.readonly = false
+		info.treeTypes = []trillian.TreeType{trillian.TreeType_LOG}
+		info.tokens = len(req.GetLeaves())
+
+	// Pre-ordered Log / readwrite
+	case *trillian.AddSequencedLeafRequest:
+		info.readonly = false
+		info.treeTypes = []trillian.TreeType{trillian.TreeType_PREORDERED_LOG}
+		info.tokens = 1
+	case *trillian.AddSequencedLeavesRequest:
+		info.readonly = false
+		info.treeTypes = []trillian.TreeType{trillian.TreeType_PREORDERED_LOG}
+		info.tokens = len(req.GetLeaves())
+
+	// (Log + Pre-ordered Log) / readwrite
+	case *trillian.InitLogRequest:
+		info.readonly = false
+		info.treeTypes = []trillian.TreeType{trillian.TreeType_LOG, trillian.TreeType_PREORDERED_LOG}
+		info.tokens = 1
+
+	// Map / readonly
+	case *trillian.GetMapLeafByRevisionRequest:
+		info.treeTypes = []trillian.TreeType{trillian.TreeType_MAP}
+		info.tokens = len(req.GetIndex())
+	case *trillian.GetMapLeafRequest:
+		info.treeTypes = []trillian.TreeType{trillian.TreeType_MAP}
+		info.tokens = len(req.GetIndex())
+	case *trillian.GetMapLeavesByRevisionRequest:
+		info.treeTypes = []trillian.TreeType{trillian.TreeType_MAP}
+		info.tokens = len(req.GetIndex())
+	case *trillian.GetMapLeavesRequest:
+		info.treeTypes = []trillian.TreeType{trillian.TreeType_MAP}
+		info.tokens = len(req.GetIndex())
+	case *trillian.GetSignedMapRootByRevisionRequest,
 		*trillian.GetSignedMapRootRequest:
-		readonly = true
+		info.treeTypes = []trillian.TreeType{trillian.TreeType_MAP}
+		info.tokens = 1
+
+	// Map / readwrite
 	case *trillian.SetMapLeavesRequest:
+		info.readonly = false
+		info.treeTypes = []trillian.TreeType{trillian.TreeType_MAP}
+		info.tokens = len(req.GetLeaves())
+	case *trillian.InitMapRequest:
+		info.readonly = false
+		info.treeTypes = []trillian.TreeType{trillian.TreeType_MAP}
+		info.tokens = 1
+
 	default:
-		ok = false
+		return nil, status.Errorf(codes.Internal, "newRPCInfo: unmapped request type: %T", req)
 	}
-	return readonly, ok
+
+	return info, nil
 }
 
-type treeIDRequest interface {
-	GetTreeId() int64
-}
+func newRPCInfo(req interface{}) (*rpcInfo, error) {
+	info, err := newRPCInfoForRequest(req)
+	if err != nil {
+		return nil, err
+	}
 
-type treeRequest interface {
-	GetTree() *trillian.Tree
+	if info.getTree || info.tokens > 0 {
+		switch req := req.(type) {
+		case logIDRequest:
+			info.treeID = req.GetLogId()
+		case mapIDRequest:
+			info.treeID = req.GetMapId()
+		case treeIDRequest:
+			info.treeID = req.GetTreeId()
+		case treeRequest:
+			info.treeID = req.GetTree().GetTreeId()
+		default:
+			return nil, status.Errorf(codes.Internal, "cannot retrieve treeID from request: %T", req)
+		}
+	}
+
+	if info.tokens > 0 {
+		kind := quota.Write
+		if info.readonly {
+			kind = quota.Read
+		}
+
+		for _, user := range chargedUsers(req) {
+			info.specs = append(info.specs, quota.Spec{Group: quota.User, Kind: kind, User: user})
+			if len(info.quotaUsers) > 0 {
+				info.quotaUsers += "+"
+			}
+			info.quotaUsers += user
+		}
+		info.specs = append(info.specs, []quota.Spec{
+			{Group: quota.Tree, Kind: kind, TreeID: info.treeID},
+			{Group: quota.Global, Kind: kind},
+		}...)
+	}
+
+	return info, nil
 }
 
 type logIDRequest interface {
@@ -381,31 +504,22 @@ type mapIDRequest interface {
 	GetMapId() int64
 }
 
-type logLeavesRequest interface {
-	GetLeaves() []*trillian.LogLeaf
+type treeIDRequest interface {
+	GetTreeId() int64
 }
 
-type mapLeavesRequest interface {
-	GetLeaves() []*trillian.MapLeaf
-}
-
-// Combine combines unary interceptors.
-// They are nested in order, so interceptor[0] calls on to (and sees the result of) interceptor[1], etc.
-func Combine(interceptors ...grpc.UnaryServerInterceptor) grpc.UnaryServerInterceptor {
-	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-		for i := len(interceptors) - 1; i >= 0; i-- {
-			interceptor := interceptors[i]
-			baseHandler := handler
-			handler = func(ctx context.Context, req interface{}) (interface{}, error) {
-				return interceptor(ctx, req, info, baseHandler)
-			}
-		}
-		return handler(ctx, req)
-	}
+type treeRequest interface {
+	GetTree() *trillian.Tree
 }
 
 // ErrorWrapper is a grpc.UnaryServerInterceptor that wraps the errors emitted by the underlying handler.
-func ErrorWrapper(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+func ErrorWrapper(ctx context.Context, req interface{}, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+	ctx, spanEnd := spanFor(ctx, "ErrorWrapper")
+	defer spanEnd()
 	rsp, err := handler(ctx, req)
 	return rsp, errors.WrapError(err)
+}
+
+func spanFor(ctx context.Context, name string) (context.Context, func()) {
+	return monitoring.StartSpan(ctx, fmt.Sprintf("%s.%s", traceSpanRoot, name))
 }

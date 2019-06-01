@@ -54,6 +54,9 @@ type AdminTX interface {
 	AdminWriter
 }
 
+// AdminTXFunc is the signature for functions passed to ReadWriteTransaction.
+type AdminTXFunc func(context.Context, AdminTX) error
+
 // AdminStorage represents the persistent storage of tree data.
 type AdminStorage interface {
 	// Snapshot starts a read-only transaction.
@@ -61,10 +64,10 @@ type AdminStorage interface {
 	// is considered consistent.
 	Snapshot(ctx context.Context) (ReadOnlyAdminTX, error)
 
-	// Begin starts a read/write transaction.
-	// A transaction must be explicitly committed before the data read by it
-	// is considered consistent.
-	Begin(ctx context.Context) (AdminTX, error)
+	// ReadWriteTransaction creates a transaction, and runs f with it.
+	// Some storage implementations may retry aborted transactions, so
+	// f MUST be idempotent.
+	ReadWriteTransaction(ctx context.Context, f AdminTXFunc) error
 
 	// CheckDatabaseAccessible checks whether we are able to connect to / open the
 	// underlying storage.
@@ -79,12 +82,12 @@ type AdminReader interface {
 	// ListTreeIDs returns the IDs of all trees in storage.
 	// Note that there's no authorization restriction on the IDs returned,
 	// so it should be used with caution in production code.
-	ListTreeIDs(ctx context.Context) ([]int64, error)
+	ListTreeIDs(ctx context.Context, includeDeleted bool) ([]int64, error)
 
 	// ListTrees returns all trees in storage.
 	// Note that there's no authorization restriction on the trees returned,
 	// so it should be used with caution in production code.
-	ListTrees(ctx context.Context) ([]*trillian.Tree, error)
+	ListTrees(ctx context.Context, includeDeleted bool) ([]*trillian.Tree, error)
 }
 
 // AdminWriter provides a write-only interface for tree data.
@@ -105,4 +108,21 @@ type AdminWriter interface {
 	// Returns an error if the tree is invalid or the update cannot be
 	// performed.
 	UpdateTree(ctx context.Context, treeID int64, updateFunc func(*trillian.Tree)) (*trillian.Tree, error)
+
+	// SoftDeleteTree soft deletes the specified tree.
+	// The tree must exist and not be already soft deleted, otherwise an error is returned.
+	// Soft deletion may be undone via UndeleteTree.
+	SoftDeleteTree(ctx context.Context, treeID int64) (*trillian.Tree, error)
+
+	// HardDeleteTree hard deletes (i.e. completely removes from storage) the specified tree and all
+	// records related to it.
+	// The tree must exist and currently be soft deleted, as per SoftDeletedTree, otherwise an error
+	// is returned.
+	// Hard deleted trees cannot be recovered.
+	HardDeleteTree(ctx context.Context, treeID int64) error
+
+	// UndeleteTree undeletes a soft-deleted tree.
+	// The tree must exist and currently be soft deleted, as per SoftDeletedTree, otherwise an error
+	// is returned.
+	UndeleteTree(ctx context.Context, treeID int64) (*trillian.Tree, error)
 }

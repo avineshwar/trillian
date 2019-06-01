@@ -18,21 +18,25 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"time"
 
 	"github.com/golang/glog"
-	pb "github.com/golang/protobuf/proto"
-	ct "github.com/google/certificate-transparency-go"
+	"github.com/golang/protobuf/proto"
 	"github.com/google/certificate-transparency-go/client"
 	"github.com/google/certificate-transparency-go/jsonclient"
 	"github.com/google/certificate-transparency-go/x509"
 	"github.com/google/trillian"
 	"github.com/google/trillian/examples/ct/ctmapper"
 	"github.com/google/trillian/examples/ct/ctmapper/ctmapperpb"
+	"github.com/google/trillian/types"
 	"google.golang.org/grpc"
+
+	pb "github.com/golang/protobuf/proto"
+	ct "github.com/google/certificate-transparency-go"
 )
 
-var sourceLog = flag.String("source", "https://ct.googleapis.com/submariner", "Source CT Log")
+var sourceLog = flag.String("source", "https://ct.googleapis.com/submariner", "URL of the CT Log")
 var mapServer = flag.String("map_server", "", "host:port for the map server")
 var mapID = flag.Int("map_id", -1, "Map ID to write to")
 var logBatchSize = flag.Int("log_batch_size", 256, "Max number of entries to process at a time from the CT Log")
@@ -77,14 +81,18 @@ func (m *CTMapper) oneMapperRun(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	meta := getRootResp.MapRoot.Metadata
 
-	startEntry := int64(0)
-
-	if meta == nil {
-		meta = &trillian.MapperMetadata{}
+	var mapRoot types.MapRootV1
+	if err := mapRoot.UnmarshalBinary(getRootResp.GetMapRoot().GetMapRoot()); err != nil {
+		return false, err
 	}
-	startEntry = meta.HighestFullyCompletedSeq + 1
+
+	mapperMetadata := &ctmapperpb.MapperMetadata{}
+	if err := proto.Unmarshal(mapRoot.Metadata, mapperMetadata); err != nil {
+		return false, fmt.Errorf("failed to unmarshal MapRoot.Metadata: %v", err)
+	}
+
+	startEntry := mapperMetadata.HighestFullyCompletedSeq + 1
 	endEntry := startEntry + int64(*logBatchSize)
 
 	glog.Infof("Fetching entries [%d, %d] from log", startEntry, endEntry)
@@ -103,11 +111,11 @@ func (m *CTMapper) oneMapperRun(ctx context.Context) (bool, error) {
 	domains := make(map[string]ctmapperpb.EntryList)
 	for _, entry := range logEntries {
 		if entry.Leaf.LeafType != ct.TimestampedEntryLeafType {
-			glog.Info("Skipping unknown entry type %v at %d", entry.Leaf.LeafType, entry.Index)
+			glog.Infof("Skipping unknown entry type %v at %d", entry.Leaf.LeafType, entry.Index)
 			continue
 		}
-		if entry.Index > meta.HighestFullyCompletedSeq {
-			meta.HighestFullyCompletedSeq = entry.Index
+		if entry.Index > mapperMetadata.HighestFullyCompletedSeq {
+			mapperMetadata.HighestFullyCompletedSeq = entry.Index
 		}
 		switch entry.Leaf.TimestampedEntry.EntryType {
 		case ct.X509LogEntryType:
@@ -135,9 +143,8 @@ func (m *CTMapper) oneMapperRun(ctx context.Context) (bool, error) {
 
 	// Fetch the current map values for those domains:
 	getReq := &trillian.GetMapLeavesRequest{
-		MapId:    m.mapID,
-		Index:    make([][]byte, 0, len(domains)),
-		Revision: -1,
+		MapId: m.mapID,
+		Index: make([][]byte, 0, len(domains)),
 	}
 	for d := range domains {
 		getReq.Index = append(getReq.Index, ctmapper.HashDomain(d))
@@ -184,14 +191,19 @@ func (m *CTMapper) oneMapperRun(ctx context.Context) (bool, error) {
 		})
 	}
 
-	setReq.MapperData = meta
+	mapperBytes, err := proto.Marshal(mapperMetadata)
+	if err != nil {
+		return false, fmt.Errorf("failed to marshal mapper metadata as 'bytes': err %v", err)
+	}
+
+	setReq.Metadata = mapperBytes
 
 	setResp, err := m.vmap.SetLeaves(context.Background(), setReq)
 	if err != nil {
 		return false, err
 	}
 	glog.Infof("Set resp: %v", setResp)
-	d := time.Now().Sub(start)
+	d := time.Since(start)
 	glog.Infof("Map run complete, took %.1f secs to update %d values (%0.2f/s)", d.Seconds(), len(setReq.Leaves), float64(len(setReq.Leaves))/d.Seconds())
 	return true, nil
 }
